@@ -124,6 +124,11 @@ from .fresh_tail import FreshTailBoundary, resolve_fresh_tail_boundary
 from .message_patterns import compile_message_patterns, matches_message_pattern
 from .aux_session import AuxiliarySessionMixin
 from .placeholder_ledger import PlaceholderLedgerMixin
+from .periodic_backup import (
+    register_periodic_backup,
+    suspend_periodic_backup_source,
+    unregister_periodic_backup,
+)
 from .reconcile import ReconcileMixin, _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
 from .compaction import CompactionMixin
 from .reset_state import ResetStateMixin
@@ -621,6 +626,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # The scheduler associates this identity only with outstanding work, so
         # diagnostic drains do not retain every historical session key forever.
         self._rollup_maintenance_owner = object()
+        self._periodic_backup_registration = register_periodic_backup(self)
 
     def clone_for_agent(self) -> "LCMEngine":
         """Return a fresh runtime engine for one AIAgent instance.
@@ -834,11 +840,30 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             current_store_home = str(getattr(getattr(self, "_store", None), "_hermes_home", "") or "")
             if current_home == str(hermes_home) and current_store_home == str(hermes_home):
                 return False
+            # Keep the current lease registered until the replacement has been
+            # admitted against this same configured source.  Releasing first
+            # can remove a single-owner source after its idle worker exits,
+            # allowing a different home/root to start a fresh ACTIVE source
+            # without the required ambiguity and historical-readmission gate.
+            previous_registration = self._periodic_backup_registration
             self._hermes_home = hermes_home
             store = getattr(self, "_store", None)
             if store is not None:
                 store._hermes_home = hermes_home
             self._reset_profile_runtime_state()
+            replacement_registration = register_periodic_backup(self)
+            if replacement_registration.state == "error":
+                # A missing or unsafe replacement root is still a root-authority
+                # transition for this configured database.  Keep and suspend the
+                # prior lease rather than unregistering it: otherwise a later
+                # valid retry can create a fresh source and publish without the
+                # required ambiguity/readmission check.
+                self._periodic_backup_registration = suspend_periodic_backup_source(
+                    previous_registration
+                ) or replacement_registration
+            else:
+                self._periodic_backup_registration = replacement_registration
+                unregister_periodic_backup(previous_registration)
             logger.info("LCM rebound Hermes home for configured database path %s", hermes_home)
             return True
 
@@ -847,10 +872,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if current_db == db_path and str(self._hermes_home or "") == str(hermes_home):
             return False
 
+        unregister_periodic_backup(self._periodic_backup_registration)
         self._close_storage()
         self._hermes_home = hermes_home
         self._bind_storage(db_path, hermes_home)
         self._reset_profile_runtime_state()
+        self._periodic_backup_registration = register_periodic_backup(self)
         logger.info("LCM rebound storage for Hermes home %s", hermes_home)
         return True
 
@@ -6655,6 +6682,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def shutdown(self):
         self._unregister_active_engine_binding()
+        unregister_periodic_backup(self._periodic_backup_registration)
         if self._adaptive_retrieval is not None:
             self._adaptive_retrieval.close()
         self._store.close()

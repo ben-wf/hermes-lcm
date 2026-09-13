@@ -378,6 +378,11 @@ Most installs only need `plugins.enabled` and `context.engine: lcm`.
 
 ### Common settings
 
+The four periodic-backup settings may also be placed under `lcm:` in
+`HERMES_HOME/config.yaml` using the field names below without the `LCM_` prefix;
+explicit `LCM_PERIODIC_BACKUP_*` environment values take precedence. `lcm_status`
+records whether each effective value came from the environment, YAML, or a default.
+
 | Variable | Default | Use |
 |----------|---------|-----|
 | `LCM_CONTEXT_THRESHOLD` | `0.35` | Fraction of the context window that triggers LCM compaction |
@@ -391,6 +396,10 @@ Most installs only need `plugins.enabled` and `context.engine: lcm`.
 | `LCM_SUMMARY_PREFIX_TARGET_TOKENS` | `0` | Sweep-only summary-frontier target; `0` derives one `LCM_LEAF_CHUNK_TOKENS` budget |
 | `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after manual `/new` (`-1` all, `0` none) |
 | `LCM_DATABASE_PATH` | auto | SQLite database path. Empty config resolves to `HERMES_HOME/lcm.db`; plugin installs or operators may set this env var to another profile-scoped path such as `~/.hermes/hermes-lcm.db`. |
+| `LCM_PERIODIC_BACKUP_ENABLED` | `false` | Enable verified periodic SQLite + referenced-payload backup bundles. Never restores automatically. |
+| `LCM_PERIODIC_BACKUP_INTERVAL_HOURS` | `6.0` | Hours between verified successful generations; must be finite, greater than zero, and fit the platform scheduler timeout after conversion to seconds. |
+| `LCM_PERIODIC_BACKUP_KEEP_LAST` | `10` | Number of newest owned generations retained per canonical source database; must be at least one. |
+| `LCM_PERIODIC_BACKUP_PATH` | empty | Destination root. Empty resolves to `backup_dir()/periodic`; each source uses a full SHA-256 canonical-path namespace. |
 | `LCM_FTS_INTEGRITY_CHECK_INTERVAL_HOURS` | `24` | Minimum hours between startup FTS5 deep integrity-checks (O(index size)). `0` checks every startup; a negative value never checks on startup. Structural checks always run regardless. |
 | `LCM_ENABLE_SLASH_COMMAND` | `false` | Enable the optional `/lcm` operator command surface |
 
