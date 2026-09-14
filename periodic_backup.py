@@ -2188,6 +2188,9 @@ class BackupSource:
     # until an ordinary compatible lease attaches. Otherwise a status query
     # could drop it and let a later incompatible root create a fresh source.
     readmission_armed: bool = False
+    # A previously admitted pathname disappeared. A new inode at that path
+    # must pass retained-history readmission before any owner can publish.
+    missing_root_replacement: bool = False
     pending_spec: PeriodicBackupSpec | None = None
     conflict_count: int = 0
     last_conflict_reason: str = ""
@@ -2227,7 +2230,7 @@ class BackupSource:
                     root_matches = _payload_root_binding(binding.path) == binding
             except (OSError, PeriodicBackupError):
                 root_matches = False
-            if not root_matches:
+            if not root_matches and self.state == "ACTIVE":
                 _suspend_source_locked(self, "payload_root_identity_changed")
             yield (
                 self.state == "ACTIVE"
@@ -2402,6 +2405,14 @@ def _conflict_registration_locked(
     source.last_conflict_reason = reason
     registration = _registration(source.key, owner, "conflict", reason)
     previous = getattr(engine, "_periodic_backup_registration", None)
+    visited: set[int] = set()
+    while (
+        isinstance(previous, PeriodicBackupRegistration)
+        and previous.retained_registration is not None
+        and id(previous) not in visited
+    ):
+        visited.add(id(previous))
+        previous = previous.retained_registration
     if (
         isinstance(previous, PeriodicBackupRegistration)
         and previous.source_key == source.key
@@ -2423,6 +2434,18 @@ def _retry_missing_root(key: str, source: BackupSource) -> bool:
             or source.reason != "payload_root_missing"
         ):
             return True
+        worker = source.scheduler
+        if worker is not None and worker.thread.is_alive():
+            return False
+        if (
+            source.missing_root_replacement
+            and source.approved_root is not None
+            and binding != source.approved_root
+        ):
+            # Recreating a pathname does not recreate its authority. Keep the
+            # retry controller bounded and non-publishing until retained
+            # references are checked through resume_backup_source().
+            return False
         source.approved_root = binding
         source.spec = replace(source.spec, payload_root_binding=binding)
         for owner in set(source.suspended_owners):
@@ -2430,6 +2453,8 @@ def _retry_missing_root(key: str, source: BackupSource) -> bool:
         source.state = "ACTIVE"
         source.reason = ""
         source.publication_epoch += 1
+        source.readmission_required = False
+        source.missing_root_replacement = False
         error = _start_worker_locked(source)
         if error:
             _drop_if_unowned_locked(source)
@@ -2557,6 +2582,9 @@ def _suspend_source_locked(source: BackupSource, reason: str) -> str:
     source.reason = reason
     source.readmission_required = True
     source.readmission_armed = False
+    source.missing_root_replacement = (
+        reason == "payload_root_missing" and source.approved_root is not None
+    )
     source.publication_epoch += 1
     for owner in owners:
         binding = source.owner_bindings.get(owner)
@@ -2625,6 +2653,27 @@ def acquire_backup_lease(engine) -> PeriodicBackupRegistration:
             if error:
                 _drop_if_unowned_locked(source)
             return registration
+        if (
+            binding is None
+            and spec.payload_root == source.spec.payload_root
+            and not (
+                source.state == "SUSPENDED"
+                and source.reason
+                not in {"payload_root_missing", "payload_root_identity_changed"}
+            )
+        ):
+            error = _suspend_source_locked(source, "payload_root_missing")
+            if error:
+                _drop_if_unowned_locked(source)
+                return _registration(key, owner, "error", error)
+            registration = _place_owner_locked(
+                source, owner, None, "suspended", "payload_root_missing"
+            )
+            error = _start_retry_controller_locked(source)
+            if error:
+                _drop_if_unowned_locked(source)
+                return _registration(key, owner, "error", error)
+            return registration
         # Root authority is the older, stronger N1 invariant. A configured-DB
         # home rebind that changes both root and destination is ambiguity, not a
         # policy-only conflict, and must suspend every existing owner.
@@ -2641,6 +2690,12 @@ def acquire_backup_lease(engine) -> PeriodicBackupRegistration:
             and source.approved_root is not None
             and binding != source.approved_root
         ):
+            error = _suspend_source_locked(source, "payload_root_ambiguous")
+            if error:
+                _drop_if_unowned_locked(source)
+                return _registration(key, owner, "error", error)
+            return _place_owner_locked(source, owner, binding, "suspended", source.reason)
+        if spec.payload_root != source.spec.payload_root:
             error = _suspend_source_locked(source, "payload_root_ambiguous")
             if error:
                 _drop_if_unowned_locked(source)
@@ -2697,7 +2752,18 @@ def acquire_backup_lease(engine) -> PeriodicBackupRegistration:
                 source.reason or "payload_root_ambiguous",
             )
         if binding is None:
-            return _registration(key, owner, "error", "periodic payload root does not exist")
+            error = _suspend_source_locked(source, "payload_root_missing")
+            if error:
+                _drop_if_unowned_locked(source)
+                return _registration(key, owner, "error", error)
+            registration = _place_owner_locked(
+                source, owner, None, "suspended", "payload_root_missing"
+            )
+            error = _start_retry_controller_locked(source)
+            if error:
+                _drop_if_unowned_locked(source)
+                return _registration(key, owner, "error", error)
+            return registration
         if binding != source.approved_root:
             error = _suspend_source_locked(source, "payload_root_ambiguous")
             if error:
@@ -2854,6 +2920,11 @@ def resume_backup_source(
             return _registration(source_key, object(), "error", "source_not_quiescent_suspended")
         try:
             binding = candidate_binding if isinstance(candidate_binding, PayloadRootBinding) else _payload_root_binding(candidate_binding)
+            missing_root_replacement = (
+                source.missing_root_replacement
+                and source.approved_root is not None
+                and binding.path == source.approved_root.path
+            )
             candidate = replace(
                 source.spec,
                 payload_root=binding.path,
@@ -2899,9 +2970,10 @@ def resume_backup_source(
         compatible_owners = {
             owner
             for owner in source.suspended_owners
-            if source.owner_bindings.get(owner) == binding
+            if missing_root_replacement or source.owner_bindings.get(owner) == binding
         }
         for owner in compatible_owners:
+            source.owner_bindings[owner] = binding
             _place_owner_locked(source, owner, binding, "active")
         # Historical authority may be consumed only after the replacement
         # worker has actually started.  Retained compatible owners make the
@@ -2916,6 +2988,10 @@ def resume_backup_source(
                 _drop_if_unowned_locked(source)
                 return _registration(source_key, object(), "error", error)
         source.readmission_required = False
+        source.missing_root_replacement = False
+        retry = source.retry_controller
+        if retry is not None:
+            retry.stop()
         return _registration(source_key, object(), "active")
 
 
