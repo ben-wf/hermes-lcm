@@ -18,7 +18,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from .db_bootstrap import configure_connection, refuse_schema_version_too_new, run_versioned_migrations
+from .db_bootstrap import (
+    SQLITE_BUSY_TIMEOUT_SECONDS,
+    configure_connection,
+    refuse_schema_version_too_new,
+    run_versioned_migrations,
+)
 
 
 def _synchronized(method):
@@ -68,7 +73,7 @@ class LifecycleStateStore:
     def _init_db(self) -> None:
         self._conn = sqlite3.connect(
             str(self.db_path),
-            timeout=30.0,
+            timeout=SQLITE_BUSY_TIMEOUT_SECONDS,
             check_same_thread=False,
             isolation_level=None,
         )

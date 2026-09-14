@@ -22,6 +22,7 @@ from typing import Any, Iterator, Literal, NamedTuple, Sequence
 import uuid
 
 from .db_bootstrap import (
+    SQLITE_BUSY_TIMEOUT_SECONDS,
     configure_connection,
     mark_migration_step_complete,
     refuse_schema_version_too_new,
@@ -536,7 +537,7 @@ class QueryViewStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(
-            str(self.db_path), timeout=5.0, check_same_thread=False
+            str(self.db_path), timeout=SQLITE_BUSY_TIMEOUT_SECONDS, check_same_thread=False
         )
         self._write_lock = threading.RLock()
         try:
