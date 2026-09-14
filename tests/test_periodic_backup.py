@@ -3384,19 +3384,34 @@ def test_n1_unowned_suspended_source_blocks_ordinary_registration_until_old_exit
 
 def test_n4_missing_payload_root_is_nonfatal_and_retry_admits_real_engine(tmp_path):
     payload_root = tmp_path / "missing-payload-root"
-    engine = _engine(tmp_path, enabled=True, payload_root=payload_root)
+    engine = _engine(
+        tmp_path,
+        enabled=True,
+        payload_root=payload_root,
+        interval_hours=0.00001,
+    )
     try:
         registration = engine._periodic_backup_registration
-        assert registration.state == "error"
-        assert registration.reason == "periodic payload root does not exist"
-        assert registration.source_key == ""
+        assert registration.state == "suspended"
+        assert registration.active is False
+        assert registration.reason == "payload_root_missing"
         source_key = str((tmp_path / "database" / "lcm.db").resolve())
-        assert source_key not in periodic._SCHEDULERS
+        assert registration.source_key == source_key
+        status = periodic.periodic_backup_source_status(source_key)
+        assert status is not None
+        assert status["state"] == "SUSPENDED"
+        assert status["reason"] == "payload_root_missing"
+        assert status["approved_root"] == ""
+        assert status["approved_root_identity"] is None
+        assert status["expected_root"] == str(payload_root.resolve())
+        assert status["active_leases"] == 0
+        assert status["suspended_leases"] == 1
+        assert status["worker_count"] == 0
+        assert status["retry_controller_count"] == 1
 
-        _payload(payload_root / "payload.json", "materialized after failed admission")
+        _payload(payload_root / "payload.json", "materialized after suspended admission")
         _append(engine, content=_placeholder("payload.json"))
-        engine._periodic_backup_registration = periodic.acquire_backup_lease(engine)
-        registration = engine._periodic_backup_registration
+        _wait_for(lambda: registration.state == "active")
         assert registration.state == "active"
         assert registration.reason == ""
         key = registration.source_key
@@ -3409,12 +3424,280 @@ def test_n4_missing_payload_root_is_nonfatal_and_retry_admits_real_engine(tmp_pa
         )
         assert status["approved_root_identity"] != (0, 0)
         assert status["active_leases"] == 1
+        assert status["worker_count"] == 1
+        _wait_for(
+            lambda: not bool(
+                (periodic.periodic_backup_source_status(key) or {}).get(
+                    "retry_controller_alive"
+                )
+            )
+        )
 
         spec = periodic.build_periodic_backup_spec(engine)
         _wait_for(lambda: (spec.namespace / "latest-good.json").exists())
         assert periodic._read_verified_pointer(spec) is not None
     finally:
         engine.shutdown()
+
+
+def test_n4_missing_payload_root_retry_controller_start_failure_isolated(
+    monkeypatch,
+    tmp_path,
+):
+    real_start = threading.Thread.start
+
+    def fail_retry_controller(thread: threading.Thread) -> None:
+        if thread.name.startswith("lcm-periodic-backup-retry-"):
+            raise RuntimeError("injected missing-root retry start failure")
+        real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_retry_controller)
+    engine = _engine(
+        tmp_path,
+        enabled=True,
+        payload_root=tmp_path / "missing-payload-root",
+    )
+    try:
+        registration = engine._periodic_backup_registration
+        assert registration.state == "error"
+        assert registration.active is False
+        assert registration.reason.startswith(
+            "periodic_retry_controller_start_failed:"
+        )
+        assert periodic.periodic_backup_source_status(registration.source_key) is None
+        _append(engine, content="ordinary LCM remains usable")
+    finally:
+        engine.shutdown()
+
+
+def test_missing_root_compatible_reacquisition_resumes_both_registrations(
+    tmp_path,
+):
+    shared = tmp_path / "shared"
+    payload_root = tmp_path / "missing-payload-root"
+    first = _engine(
+        shared,
+        enabled=True,
+        payload_root=payload_root,
+        interval_hours=6.0,
+    )
+    second = None
+    try:
+        first_registration = first._periodic_backup_registration
+        assert first_registration.state == "suspended"
+        _payload(payload_root / "payload.json", "recreated for reacquisition")
+        _append(first, content=_placeholder("payload.json"))
+
+        second = _engine(
+            shared,
+            enabled=True,
+            payload_root=payload_root,
+            interval_hours=6.0,
+        )
+        second_registration = second._periodic_backup_registration
+        assert first_registration.state == "active"
+        assert second_registration.state == "active"
+        key = first_registration.source_key
+        status = periodic.periodic_backup_source_status(key)
+        assert status is not None
+        assert status["active_leases"] == 2
+        assert status["worker_count"] == 1
+        spec = periodic.build_periodic_backup_spec(first)
+        _wait_for(lambda: len(_generation_dirs(spec)) == 1)
+        assert periodic._read_verified_pointer(spec) is not None
+    finally:
+        if second is not None:
+            second.shutdown()
+        first.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("field", "second_kwargs"),
+    [
+        ("destination", {"destination": "different"}),
+        ("interval", {"interval_hours": 3.0}),
+        ("retention", {"keep_last": 3}),
+    ],
+)
+def test_same_root_scheduler_spec_conflicts_are_truthful_and_non_mutating(
+    tmp_path,
+    field,
+    second_kwargs,
+):
+    shared = tmp_path / "shared"
+    payload_root = tmp_path / "payloads"
+    destination = tmp_path / "periodic"
+    _payload(payload_root / "payload.json", "shared payload")
+    first = _engine(
+        shared,
+        enabled=True,
+        payload_root=payload_root,
+        destination=destination,
+        interval_hours=2.0,
+        keep_last=2,
+    )
+    _append(first, content=_placeholder("payload.json"))
+    first_spec = periodic.build_periodic_backup_spec(first)
+    _wait_for(lambda: (first_spec.namespace / "latest-good.json").exists())
+    pointer_before = (first_spec.namespace / "latest-good.json").read_bytes()
+    generations_before = [path.name for path in _generation_dirs(first_spec)]
+    kwargs = {
+        "enabled": True,
+        "payload_root": payload_root,
+        "destination": destination,
+        "interval_hours": 2.0,
+        "keep_last": 2,
+    }
+    kwargs.update(second_kwargs)
+    if field == "destination":
+        kwargs["destination"] = tmp_path / str(second_kwargs["destination"])
+    second = None
+    try:
+        second = _engine(shared, **kwargs)
+        key = first._periodic_backup_registration.source_key
+        source = periodic._SCHEDULERS[key]
+        worker = source.scheduler
+        registration = second._periodic_backup_registration
+        assert registration.state == "conflict"
+        assert registration.active is False
+        assert registration.reason == f"periodic_scheduler_spec_conflict:{field}"
+        status = periodic.periodic_backup_source_status(key)
+        assert status is not None
+        assert status["state"] == "ACTIVE"
+        assert status["destination"] == str(destination.resolve())
+        assert status["interval_seconds"] == 2.0 * 3600.0
+        assert status["keep_last"] == 2
+        assert status["active_leases"] == 1
+        assert status["worker_count"] == 1
+        assert source.scheduler is worker
+        assert registration.owner not in source.registrations
+        assert (first_spec.namespace / "latest-good.json").read_bytes() == pointer_before
+        assert [path.name for path in _generation_dirs(first_spec)] == generations_before
+        if field == "destination":
+            assert not Path(kwargs["destination"]).exists()
+        if field == "retention":
+            for _ in range(3):
+                assert periodic.run_periodic_backup(
+                    source.spec, due_only=False
+                )["status"] == "ok"
+            assert len(_generation_dirs(first_spec)) == 2
+    finally:
+        if second is not None:
+            second.shutdown()
+        first.shutdown()
+
+
+def test_conflicting_reacquisition_retains_only_old_release_handle(tmp_path):
+    payload_root = tmp_path / "payloads"
+    payload_root.mkdir(mode=0o700)
+    engine = _engine(
+        tmp_path,
+        enabled=True,
+        payload_root=payload_root,
+        destination=tmp_path / "old-destination",
+    )
+    key = engine._periodic_backup_registration.source_key
+    old_registration = engine._periodic_backup_registration
+    engine._config.periodic_backup_path = str(tmp_path / "new-destination")
+    try:
+        conflict = periodic.acquire_backup_lease(engine)
+        engine._periodic_backup_registration = conflict
+        assert conflict.state == "conflict"
+        assert conflict.active is False
+        assert conflict.retained_registration is old_registration
+        source = periodic._SCHEDULERS[key]
+        assert source.active_owners == {old_registration.owner}
+        assert conflict.owner not in source.registrations
+        assert not (tmp_path / "new-destination").exists()
+    finally:
+        engine.shutdown()
+    _wait_for(lambda: periodic.periodic_backup_source_status(key) is None)
+
+
+def test_equivalent_alias_shares_one_scheduler_and_full_release_allows_reconfigure(
+    monkeypatch,
+    tmp_path,
+):
+    shared = tmp_path / "shared"
+    payload_root = tmp_path / "payloads"
+    payload_root.mkdir(mode=0o700)
+    destination = tmp_path / "periodic"
+    destination_alias = tmp_path / "periodic-alias"
+    destination.mkdir(mode=0o700)
+    destination_alias.symlink_to(destination, target_is_directory=True)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_run(*_args, cancel=None, **_kwargs):
+        assert cancel is not None
+        entered.set()
+        assert release.wait(5)
+        return {"ok": False, "status": "cancelled" if cancel.is_set() else "failed"}
+
+    monkeypatch.setattr(periodic, "run_periodic_backup", blocked_run)
+    monkeypatch.setattr(periodic, "_SCHEDULER_SHUTDOWN_TIMEOUT_SECONDS", 0.05)
+    first = _engine(
+        shared,
+        enabled=True,
+        payload_root=payload_root,
+        destination=destination,
+        interval_hours=2.0,
+        keep_last=2,
+    )
+    equivalent = _engine(
+        shared,
+        enabled=True,
+        payload_root=payload_root,
+        destination=destination_alias,
+        interval_hours=2.0,
+        keep_last=2,
+    )
+    changed = _engine(
+        shared,
+        enabled=False,
+        payload_root=payload_root,
+        destination=tmp_path / "changed-periodic",
+        interval_hours=3.0,
+        keep_last=3,
+    )
+    key = first._periodic_backup_registration.source_key
+    source = periodic._SCHEDULERS[key]
+    old_worker = source.scheduler
+    try:
+        assert entered.wait(5)
+        assert equivalent._periodic_backup_registration.state == "active"
+        assert periodic.periodic_backup_source_status(key)["worker_count"] == 1
+        assert periodic.release_backup_lease(
+            equivalent._periodic_backup_registration
+        ) is True
+        equivalent._periodic_backup_registration = None
+        assert periodic.release_backup_lease(first._periodic_backup_registration) is False
+        first._periodic_backup_registration = None
+
+        changed._config.periodic_backup_enabled = True
+        changed._periodic_backup_registration = periodic.acquire_backup_lease(changed)
+        pending = changed._periodic_backup_registration
+        assert pending.state == "pending"
+        assert pending.active is False
+        assert pending.reason == "waiting_for_stopping_worker_reconfiguration"
+        assert source.spec.destination_root == destination.resolve()
+        assert source.scheduler is old_worker
+
+        release.set()
+        assert old_worker is not None
+        old_worker.thread.join(5)
+        assert not old_worker.thread.is_alive()
+        _wait_for(lambda: pending.state == "active")
+        assert source.spec.destination_root == (tmp_path / "changed-periodic").resolve()
+        assert source.spec.interval_seconds == 3.0 * 3600.0
+        assert source.spec.keep_last == 3
+        assert source.scheduler is not None and source.scheduler is not old_worker
+        assert periodic.periodic_backup_source_status(key)["worker_count"] == 1
+    finally:
+        release.set()
+        changed.shutdown()
+        equivalent.shutdown()
+        first.shutdown()
 
 
 def test_n4_invalid_retention_is_nonfatal_and_allocates_no_backup_state(tmp_path):

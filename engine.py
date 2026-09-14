@@ -861,6 +861,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 self._periodic_backup_registration = suspend_periodic_backup_source(
                     previous_registration
                 ) or replacement_registration
+            elif replacement_registration.state == "conflict":
+                # The new policy owns no lease. acquire_backup_lease retained
+                # the old handle so shutdown can release it without presenting
+                # the rejected request as active or implicitly superseding it.
+                self._periodic_backup_registration = replacement_registration
             else:
                 self._periodic_backup_registration = replacement_registration
                 unregister_periodic_backup(previous_registration)

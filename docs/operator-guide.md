@@ -273,6 +273,21 @@ current plus retained `latest-good` references against one candidate root. This
 is not a multi-root routing feature, and multiple processes, hosts, and network
 filesystems remain outside the guarantee.
 
+If the configured canonical payload-root pathname does not exist at initial
+admission, the source reports `SUSPENDED` with `payload_root_missing`, has no
+backup worker, and uses at most one bounded retry controller. The next retry tick
+or a compatible engine acquisition revalidates the pathname; once it is again a
+private plain directory, the source captures a fresh identity and starts exactly
+one worker. The controller never creates the root or publishes a generation.
+
+The effective destination, validated interval, and retention are immutable while
+any lease remains admitted. A same-database/root request that changes one of
+those fields reports a typed `periodic_scheduler_spec_conflict:*` result and owns
+no lease; the existing worker and effective policy remain unchanged. Reconfigure
+only by fully releasing the old policy and acquiring the new one. If the old
+worker is still exiting, the new request remains non-active until that actual
+exit, and no old/new workers overlap.
+
 Before publication, staged database and payload bytes are revalidated under the
 source publication gate. A same-size in-place staged mutation rejects the new
 generation and preserves the prior pointer bytes and retention set. This narrows

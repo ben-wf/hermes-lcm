@@ -403,6 +403,13 @@ records whether each effective value came from the environment, YAML, or a defau
 | `LCM_FTS_INTEGRITY_CHECK_INTERVAL_HOURS` | `24` | Minimum hours between startup FTS5 deep integrity-checks (O(index size)). `0` checks every startup; a negative value never checks on startup. Structural checks always run regardless. |
 | `LCM_ENABLE_SLASH_COMMAND` | `false` | Enable the optional `/lcm` operator command surface |
 
+An enabled scheduler whose externalized-payload root is missing is suspended,
+not reported active. It rechecks on a bounded scheduler cadence and on compatible
+engine acquisition, then resumes one worker after the same private root becomes
+valid. A canonical database has one immutable active destination, interval, and
+retention policy: conflicting requests are rejected rather than silently sharing
+the old worker. Change that policy only after every existing lease is released.
+
 When `LCM_FRESH_TAIL_MAX_TOKENS` is enabled, the protected suffix must satisfy
 both the message-count and token bounds. The newest message is never dropped,
 and a boundary that would begin inside an assistant tool-call/result group is

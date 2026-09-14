@@ -133,6 +133,9 @@ class PeriodicBackupRegistration:
     error: str = ""
     state: str = "disabled"
     reason: str = ""
+    # A rejected reconfiguration must remain releasable without pretending the
+    # rejected policy owns a lease. Shutdown follows this admitted handle.
+    retained_registration: "PeriodicBackupRegistration | None" = None
 
 
 @dataclass(frozen=True)
@@ -233,7 +236,11 @@ def _validate_admission_primitives() -> None:
         raise PeriodicBackupUnsupported("directory fsync is unsupported on this platform")
 
 
-def build_periodic_backup_spec(engine) -> PeriodicBackupSpec:
+def build_periodic_backup_spec(
+    engine,
+    *,
+    allow_missing_payload_root: bool = False,
+) -> PeriodicBackupSpec:
     """Resolve immutable scheduler settings without creating backup state."""
     # LCMConfig validates at construction, but runtime reconfiguration can mutate
     # its fields before a later engine/lease admission. Re-run the authoritative
@@ -273,6 +280,12 @@ def build_periodic_backup_spec(engine) -> PeriodicBackupSpec:
         raise PeriodicBackupError(
             "periodic backup interval is invalid or exceeds the platform scheduler timeout limit"
         )
+    try:
+        payload_root_binding = _payload_root_binding(payload_root)
+    except PeriodicBackupError:
+        if not allow_missing_payload_root or payload_root.exists():
+            raise
+        payload_root_binding = None
     return PeriodicBackupSpec(
         source_db=source_db,
         source_identity=identity,
@@ -281,7 +294,7 @@ def build_periodic_backup_spec(engine) -> PeriodicBackupSpec:
         namespace=destination_root / identity,
         interval_seconds=interval_seconds,
         keep_last=engine._config.periodic_backup_keep_last,
-        payload_root_binding=_payload_root_binding(payload_root),
+        payload_root_binding=payload_root_binding,
     )
 
 
@@ -2107,22 +2120,63 @@ class _Scheduler:
         return not self.thread.is_alive()
 
 
+class _MissingRootRetryController:
+    """Bounded admission retry for a configured root that does not yet exist."""
+
+    def __init__(self, source: "BackupSource"):
+        self.source = source
+        self.cancel = threading.Event()
+        self.condition = threading.Condition()
+        self.thread = threading.Thread(
+            target=self._run,
+            name=f"lcm-periodic-backup-retry-{source.spec.source_identity[:12]}",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def _run(self) -> None:
+        # Use the configured cadence, but cap it so enabled scheduling cannot be
+        # silently inert for hours after an operator restores the root.
+        wait_for = min(60.0, max(0.01, self.source.spec.interval_seconds))
+        try:
+            while not self.cancel.is_set():
+                with self.condition:
+                    self.condition.wait_for(self.cancel.is_set, timeout=wait_for)
+                if self.cancel.is_set():
+                    return
+                if _retry_missing_root(self.source.key, self.source):
+                    return
+        finally:
+            with _REGISTRY_LOCK:
+                if self.source.retry_controller is self:
+                    self.source.retry_controller = None
+                    _drop_if_unowned_locked(self.source)
+
+    def stop(self) -> None:
+        self.cancel.set()
+        with self.condition:
+            self.condition.notify_all()
+
+
 @dataclass
 class BackupSource:
     """Single process-local source of truth for a canonical SQLite database."""
 
     key: str
     spec: PeriodicBackupSpec
-    approved_root: PayloadRootBinding
+    approved_root: PayloadRootBinding | None
     state: str = "ACTIVE"
     reason: str = ""
     publication_epoch: int = 0
     scheduler: _Scheduler | None = None
+    retry_controller: _MissingRootRetryController | None = None
     handoff_thread: threading.Thread | None = None
     active_owners: set[object] = None  # type: ignore[assignment]
     pending_owners: set[object] = None  # type: ignore[assignment]
     suspended_owners: set[object] = None  # type: ignore[assignment]
-    owner_bindings: dict[object, PayloadRootBinding] = None  # type: ignore[assignment]
+    owner_bindings: dict[object, PayloadRootBinding | None] = None  # type: ignore[assignment]
     registrations: dict[object, PeriodicBackupRegistration] = None  # type: ignore[assignment]
     readmission: dict[str, Any] | None = None
     # Once a distinct root has made history ambiguous, an optional scheduling
@@ -2134,6 +2188,9 @@ class BackupSource:
     # until an ordinary compatible lease attaches. Otherwise a status query
     # could drop it and let a later incompatible root create a fresh source.
     readmission_armed: bool = False
+    pending_spec: PeriodicBackupSpec | None = None
+    conflict_count: int = 0
+    last_conflict_reason: str = ""
 
     def __post_init__(self) -> None:
         self.active_owners = set()
@@ -2161,6 +2218,7 @@ class BackupSource:
             try:
                 root_matches = (
                     binding is not None
+                    and self.approved_root is not None
                     and binding == self.approved_root
                     and binding.device != 0
                     and binding.inode != 0
@@ -2181,19 +2239,33 @@ class BackupSource:
 
     def status(self) -> dict[str, Any]:
         worker = self.scheduler.thread if self.scheduler is not None else None
+        retry = self.retry_controller.thread if self.retry_controller is not None else None
         handoff = self.handoff_thread
         return {
             "source_key": self.key,
             "state": self.state,
             "reason": self.reason,
             "publication_epoch": self.publication_epoch,
-            "approved_root": str(self.approved_root.path),
-            "approved_root_identity": (self.approved_root.device, self.approved_root.inode),
+            "approved_root": str(self.approved_root.path) if self.approved_root is not None else "",
+            "approved_root_identity": (
+                (self.approved_root.device, self.approved_root.inode)
+                if self.approved_root is not None
+                else None
+            ),
+            "expected_root": str(self.spec.payload_root),
+            "destination": str(self.spec.destination_root),
+            "interval_seconds": self.spec.interval_seconds,
+            "keep_last": self.spec.keep_last,
             "active_leases": len(self.active_owners),
             "pending_leases": len(self.pending_owners),
             "suspended_leases": len(self.suspended_owners),
             "worker_alive": bool(worker and worker.is_alive()),
+            "worker_count": int(bool(worker and worker.is_alive())),
+            "retry_controller_alive": bool(retry and retry.is_alive()),
+            "retry_controller_count": int(bool(retry and retry.is_alive())),
             "handoff_alive": bool(handoff and handoff.is_alive()),
+            "conflict_count": self.conflict_count,
+            "last_conflict_reason": self.last_conflict_reason,
             "readmission": dict(self.readmission or {}),
             "readmission_required": self.readmission_required,
             "readmission_armed": self.readmission_armed,
@@ -2236,7 +2308,7 @@ def _set_registration_state(
 def _place_owner_locked(
     source: BackupSource,
     owner: object,
-    binding: PayloadRootBinding,
+    binding: PayloadRootBinding | None,
     state: str,
     reason: str = "",
 ) -> PeriodicBackupRegistration:
@@ -2289,6 +2361,84 @@ def _start_worker_locked(source: BackupSource) -> str:
     return ""
 
 
+def _start_retry_controller_locked(source: BackupSource) -> str:
+    retry = source.retry_controller
+    if retry is not None and retry.thread.is_alive():
+        return ""
+    retry = _MissingRootRetryController(source)
+    source.retry_controller = retry
+    try:
+        retry.start()
+    except RuntimeError as exc:
+        source.retry_controller = None
+        reason = f"periodic_retry_controller_start_failed:{exc}"
+        _fail_source_locked(source, reason)
+        return reason
+    return ""
+
+
+def _spec_conflict_fields(
+    current: PeriodicBackupSpec,
+    candidate: PeriodicBackupSpec,
+) -> list[str]:
+    fields: list[str] = []
+    if current.destination_root != candidate.destination_root:
+        fields.append("destination")
+    if current.interval_seconds != candidate.interval_seconds:
+        fields.append("interval")
+    if current.keep_last != candidate.keep_last:
+        fields.append("retention")
+    return fields
+
+
+def _conflict_registration_locked(
+    source: BackupSource,
+    owner: object,
+    fields: list[str],
+    engine,
+) -> PeriodicBackupRegistration:
+    reason = f"periodic_scheduler_spec_conflict:{'+'.join(fields)}"
+    source.conflict_count += 1
+    source.last_conflict_reason = reason
+    registration = _registration(source.key, owner, "conflict", reason)
+    previous = getattr(engine, "_periodic_backup_registration", None)
+    if (
+        isinstance(previous, PeriodicBackupRegistration)
+        and previous.source_key == source.key
+        and previous.owner in source.registrations
+    ):
+        registration.retained_registration = previous
+    return registration
+
+
+def _retry_missing_root(key: str, source: BackupSource) -> bool:
+    try:
+        binding = _payload_root_binding(source.spec.payload_root)
+    except (OSError, PeriodicBackupError):
+        return False
+    with _REGISTRY_LOCK:
+        if (
+            _SCHEDULERS.get(key) is not source
+            or source.state != "SUSPENDED"
+            or source.reason != "payload_root_missing"
+        ):
+            return True
+        source.approved_root = binding
+        source.spec = replace(source.spec, payload_root_binding=binding)
+        for owner in set(source.suspended_owners):
+            _place_owner_locked(source, owner, binding, "active")
+        source.state = "ACTIVE"
+        source.reason = ""
+        source.publication_epoch += 1
+        error = _start_worker_locked(source)
+        if error:
+            _drop_if_unowned_locked(source)
+        retry = source.retry_controller
+        if retry is not None:
+            retry.stop()
+        return True
+
+
 def _drop_if_unowned_locked(source: BackupSource) -> None:
     worker = source.scheduler
     if worker is not None and not worker.thread.is_alive():
@@ -2296,6 +2446,9 @@ def _drop_if_unowned_locked(source: BackupSource) -> None:
     handoff = source.handoff_thread
     if handoff is not None and not handoff.is_alive():
         source.handoff_thread = None
+    retry = source.retry_controller
+    if retry is not None and not retry.thread.is_alive():
+        source.retry_controller = None
     if (
         source.readmission_required
         and source.state == "ERROR"
@@ -2305,6 +2458,10 @@ def _drop_if_unowned_locked(source: BackupSource) -> None:
         source.state = "SUSPENDED"
         source.reason = f"historical_readmission_required:{source.reason}"
     if source.active_owners or source.pending_owners or source.suspended_owners:
+        return
+    retry = source.retry_controller
+    if retry is not None and retry.thread.is_alive():
+        retry.stop()
         return
     worker = source.scheduler
     if worker is not None and worker.thread.is_alive():
@@ -2343,6 +2500,10 @@ def _complete_handoff(key: str, source: BackupSource, worker: _Scheduler) -> Non
             source.reason = ""
             _drop_if_unowned_locked(source)
             return
+        if source.pending_spec is not None:
+            source.spec = source.pending_spec
+            source.pending_spec = None
+            source.approved_root = source.spec.payload_root_binding
         for owner in retained:
             binding = source.owner_bindings.get(owner)
             if binding is not None:
@@ -2423,8 +2584,8 @@ def acquire_backup_lease(engine) -> PeriodicBackupRegistration:
     if getattr(engine._config, "periodic_backup_enabled", False) is False:
         return _registration("", owner, "disabled")
     try:
-        spec = build_periodic_backup_spec(engine)
-        binding = spec.payload_root_binding or _payload_root_binding(spec.payload_root)
+        spec = build_periodic_backup_spec(engine, allow_missing_payload_root=True)
+        binding = spec.payload_root_binding
     except Exception as exc:
         logger.warning("LCM periodic backup registration failed closed: %s", exc)
         return _registration("", owner, "error", str(exc))
@@ -2437,6 +2598,26 @@ def acquire_backup_lease(engine) -> PeriodicBackupRegistration:
             if source is not None and source.state == "ERROR":
                 return _registration(key, owner, "error", source.reason)
         if source is None:
+            if binding is None:
+                source = BackupSource(
+                    key,
+                    spec,
+                    None,
+                    state="SUSPENDED",
+                    reason="payload_root_missing",
+                )
+                registration = _place_owner_locked(
+                    source,
+                    owner,
+                    None,
+                    "suspended",
+                    "payload_root_missing",
+                )
+                _SCHEDULERS[key] = source
+                error = _start_retry_controller_locked(source)
+                if error:
+                    _drop_if_unowned_locked(source)
+                return registration
             source = BackupSource(key, spec, binding)
             registration = _place_owner_locked(source, owner, binding, "active")
             _SCHEDULERS[key] = source
@@ -2444,6 +2625,69 @@ def acquire_backup_lease(engine) -> PeriodicBackupRegistration:
             if error:
                 _drop_if_unowned_locked(source)
             return registration
+        # Root authority is the older, stronger N1 invariant. A configured-DB
+        # home rebind that changes both root and destination is ambiguity, not a
+        # policy-only conflict, and must suspend every existing owner.
+        if source.state == "SUSPENDED" and source.reason != "payload_root_missing":
+            return _place_owner_locked(
+                source,
+                owner,
+                binding,
+                "suspended",
+                source.reason or "payload_root_ambiguous",
+            )
+        if (
+            binding is not None
+            and source.approved_root is not None
+            and binding != source.approved_root
+        ):
+            error = _suspend_source_locked(source, "payload_root_ambiguous")
+            if error:
+                _drop_if_unowned_locked(source)
+                return _registration(key, owner, "error", error)
+            return _place_owner_locked(source, owner, binding, "suspended", source.reason)
+
+        comparison_spec = source.pending_spec or source.spec
+        conflicts = _spec_conflict_fields(comparison_spec, spec)
+        worker = source.scheduler
+        fully_released_stopping = (
+            not source.active_owners
+            and not source.pending_owners
+            and not source.suspended_owners
+            and worker is not None
+            and worker.cancel.is_set()
+            and worker.thread.is_alive()
+        )
+        if conflicts and not fully_released_stopping:
+            return _conflict_registration_locked(source, owner, conflicts, engine)
+        if conflicts and fully_released_stopping:
+            source.pending_spec = spec
+            registration = _place_owner_locked(
+                source,
+                owner,
+                binding,
+                "pending",
+                "waiting_for_stopping_worker_reconfiguration",
+            )
+            source.state = "PENDING"
+            source.reason = "waiting_for_stopping_worker_reconfiguration"
+            error = _queue_handoff_locked(source)
+            if error:
+                _drop_if_unowned_locked(source)
+            return registration
+        if source.state == "SUSPENDED" and source.reason == "payload_root_missing":
+            if binding is None:
+                registration = _place_owner_locked(
+                    source, owner, None, "suspended", "payload_root_missing"
+                )
+                error = _start_retry_controller_locked(source)
+                if error:
+                    _drop_if_unowned_locked(source)
+                return registration
+            _retry_missing_root(key, source)
+            if source.state == "ERROR":
+                return _registration(key, owner, "error", source.reason)
+            return _place_owner_locked(source, owner, binding, "active")
         if source.state == "SUSPENDED":
             return _place_owner_locked(
                 source,
@@ -2452,6 +2696,8 @@ def acquire_backup_lease(engine) -> PeriodicBackupRegistration:
                 "suspended",
                 source.reason or "payload_root_ambiguous",
             )
+        if binding is None:
+            return _registration(key, owner, "error", "periodic payload root does not exist")
         if binding != source.approved_root:
             error = _suspend_source_locked(source, "payload_root_ambiguous")
             if error:
@@ -2463,7 +2709,6 @@ def acquire_backup_lease(engine) -> PeriodicBackupRegistration:
                 _drop_if_unowned_locked(source)
                 return _registration(key, owner, "error", error)
             return _place_owner_locked(source, owner, binding, "suspended", source.reason)
-        worker = source.scheduler
         if worker is not None and worker.cancel.is_set() and worker.thread.is_alive():
             registration = _place_owner_locked(source, owner, binding, "pending", "waiting_for_stopping_worker")
             source.state = "PENDING"
@@ -2518,6 +2763,10 @@ def suspend_periodic_backup_source(
 def release_backup_lease(registration: PeriodicBackupRegistration | None) -> bool:
     if registration is None or not registration.source_key:
         return True
+    if registration.retained_registration is not None:
+        retained = registration.retained_registration
+        registration.retained_registration = None
+        return release_backup_lease(retained)
     with _REGISTRY_LOCK:
         source = _SCHEDULERS.get(registration.source_key)
         if source is None:
