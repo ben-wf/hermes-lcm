@@ -2876,6 +2876,135 @@ def test_n1_suspension_handoff_start_failure_is_error_and_reaps_after_worker_exi
         engine.shutdown()
 
 
+@pytest.mark.parametrize("field", ["destination", "interval", "retention"])
+def test_n4_error_conflicts_before_retained_handoff_failure(
+    monkeypatch,
+    tmp_path,
+    field,
+):
+    home_one = tmp_path / "home-one"
+    home_two = tmp_path / "home-two"
+    root_one = home_one / "lcm-large-outputs"
+    root_two = home_two / "lcm-large-outputs"
+    _payload(root_one / "shared.json", "approved root payload")
+    _payload(root_two / "shared.json", "different candidate payload")
+    destination = tmp_path / "periodic"
+
+    def config(**overrides):
+        values = {
+            "database_path": str(tmp_path / "shared.db"),
+            "periodic_backup_enabled": True,
+            "periodic_backup_interval_hours": 0.00001,
+            "periodic_backup_keep_last": 2,
+            "periodic_backup_path": str(destination),
+        }
+        values.update(overrides)
+        return LCMConfig(**values)
+
+    engine = LCMEngine(config=config(periodic_backup_enabled=False), hermes_home=str(home_one))
+    _append(engine, content=_placeholder("shared.json"))
+    original_spec = periodic.build_periodic_backup_spec(engine)
+    assert periodic.run_periodic_backup(original_spec, due_only=False)["status"] == "ok"
+    pointer_before = (original_spec.namespace / "latest-good.json").read_bytes()
+    generations_before = [path.name for path in _generation_dirs(original_spec)]
+
+    entered = threading.Event()
+    release = threading.Event()
+    real_start = threading.Thread.start
+
+    def blocked_run(*_args, cancel=None, **_kwargs):
+        assert cancel is not None
+        entered.set()
+        assert release.wait(5)
+        return {"ok": False, "status": "cancelled" if cancel.is_set() else "failed"}
+
+    def fail_only_handoff_start(thread: threading.Thread) -> None:
+        if thread.name.startswith("lcm-backup-handoff-"):
+            raise RuntimeError("injected suspension handoff start failure")
+        real_start(thread)
+
+    monkeypatch.setattr(periodic, "run_periodic_backup", blocked_run)
+    engine._config.periodic_backup_enabled = True
+    engine._periodic_backup_registration = periodic.acquire_backup_lease(engine)
+    key = engine._periodic_backup_registration.source_key
+    source = periodic._SCHEDULERS[key]
+    old_worker = source.scheduler
+    assert old_worker is not None
+    conflicting = None
+    matching = None
+    try:
+        assert entered.wait(5)
+        monkeypatch.setattr(threading.Thread, "start", fail_only_handoff_start)
+        assert engine._rebind_storage_for_home(str(home_two)) is True
+        assert source.state == "ERROR"
+        assert source.reason.startswith("periodic_handoff_start_failed:")
+        assert old_worker.thread.is_alive()
+        assert old_worker.cancel.is_set()
+
+        def authority_snapshot():
+            return (
+                source.state,
+                source.reason,
+                source.scheduler,
+                source.handoff_thread,
+                source.retry_controller,
+                source.spec,
+                source.canonical_policy,
+                source.approved_root,
+                source.approved_root_history,
+                source.publication_epoch,
+                source.readmission_required,
+                source.readmission_armed,
+                source.missing_root_replacement,
+                set(source.active_owners),
+                set(source.pending_owners),
+                set(source.suspended_owners),
+                dict(source.owner_records),
+                dict(source.owner_bindings),
+                dict(source.registrations),
+            )
+
+        authority_before = authority_snapshot()
+        overrides = {}
+        if field == "destination":
+            overrides["periodic_backup_path"] = str(tmp_path / "changed-periodic")
+        elif field == "interval":
+            overrides["periodic_backup_interval_hours"] = 3.0
+        else:
+            overrides["periodic_backup_keep_last"] = 3
+
+        conflicting = LCMEngine(
+            config=config(**overrides),
+            hermes_home=str(home_one),
+        )
+        rejected = conflicting._periodic_backup_registration
+        assert rejected.state == "conflict"
+        assert rejected.reason == f"periodic_scheduler_spec_conflict:{field}"
+        assert rejected.owner not in source.owner_records
+        assert authority_snapshot() == authority_before
+        assert old_worker.thread.is_alive()
+        assert (original_spec.namespace / "latest-good.json").read_bytes() == pointer_before
+        assert [path.name for path in _generation_dirs(original_spec)] == generations_before
+
+        matching = LCMEngine(config=config(), hermes_home=str(home_one))
+        retained_error = matching._periodic_backup_registration
+        assert retained_error.state == "error"
+        assert retained_error.reason == source.reason
+        assert retained_error.owner not in source.owner_records
+        assert authority_snapshot() == authority_before
+        assert (original_spec.namespace / "latest-good.json").read_bytes() == pointer_before
+        assert [path.name for path in _generation_dirs(original_spec)] == generations_before
+    finally:
+        monkeypatch.setattr(threading.Thread, "start", real_start)
+        release.set()
+        old_worker.thread.join(5)
+        if matching is not None:
+            matching.shutdown()
+        if conflicting is not None:
+            conflicting.shutdown()
+        engine.shutdown()
+
+
 def test_n1_failed_suspension_handoff_preserves_history_until_explicit_readmission(
     monkeypatch,
     tmp_path,

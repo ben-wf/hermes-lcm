@@ -2727,6 +2727,13 @@ def acquire_backup_lease(engine) -> PeriodicBackupRegistration:
             _drop_if_unowned_locked(source)
             source = _SCHEDULERS.get(key)
             if source is not None and source.state == "ERROR":
+                canonical_policy = source.canonical_policy
+                assert canonical_policy is not None
+                conflicts = _policy_conflict_fields(canonical_policy, requested_policy)
+                if conflicts:
+                    return _conflict_registration_locked(
+                        source, owner, conflicts, engine
+                    )
                 return _registration(key, owner, "error", source.reason)
         if source is None:
             if binding is None:
