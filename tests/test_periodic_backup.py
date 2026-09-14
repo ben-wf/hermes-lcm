@@ -1928,7 +1928,7 @@ def test_reverification_rejects_payload_directory_replacement_during_database_ha
         engine.shutdown()
 
 
-def test_configured_database_rebind_suspends_before_releasing_prior_root_authority(
+def test_configured_database_rebind_conflicts_before_root_or_owner_mutation(
     monkeypatch,
     tmp_path,
 ):
@@ -1964,23 +1964,31 @@ def test_configured_database_rebind_suspends_before_releasing_prior_root_authori
         assert entered.wait(5)
         assert engine._rebind_storage_for_home(str(home_b)) is True
         spec_b = periodic.build_periodic_backup_spec(engine)
-        assert engine._periodic_backup_registration.state == "suspended"
-        assert engine._periodic_backup_registration.reason == "payload_root_ambiguous"
+        first_conflict = engine._periodic_backup_registration
+        assert first_conflict.state == "conflict"
+        assert first_conflict.reason == "periodic_scheduler_spec_conflict:destination"
+        assert first_conflict.retained_registration is old.registrations[
+            next(iter(old.active_owners))
+        ]
+        assert old.state == "ACTIVE"
+        assert old.reason == ""
         assert periodic._SCHEDULERS[key] is old
-        assert old.thread.is_alive() and old.cancel.is_set()
+        assert old.thread.is_alive() and not old.cancel.is_set()
 
         assert engine._rebind_storage_for_home(str(home_c)) is True
         spec_c = periodic.build_periodic_backup_spec(engine)
         assert spec_b != spec_c
-        assert engine._periodic_backup_registration.state == "suspended"
+        second_conflict = engine._periodic_backup_registration
+        assert second_conflict.state == "conflict"
+        assert second_conflict.retained_registration is first_conflict.retained_registration
         assert periodic._SCHEDULERS[key] is old
 
         release.set()
+        engine.shutdown()
         assert old_worker is not None
         old_worker.thread.join(5)
         assert not old_worker.thread.is_alive()
-        status = periodic.periodic_backup_source_status(key)
-        assert status is not None and status["state"] == "SUSPENDED"
+        _wait_for(lambda: periodic.periodic_backup_source_status(key) is None)
         assert not (spec_b.namespace / "latest-good.json").exists()
         assert not (spec_c.namespace / "latest-good.json").exists()
     finally:
@@ -2113,11 +2121,12 @@ def test_configured_database_failed_rebind_preserves_authority_for_later_root_re
         retry = periodic.acquire_backup_lease(engine)
         assert retry.state == "suspended"
         assert retry.reason == "payload_root_ambiguous"
+        assert retry is engine._periodic_backup_registration
         status = periodic.periodic_backup_source_status(key)
         assert status is not None
         assert status["state"] == "SUSPENDED"
         assert status["worker_alive"] is False
-        assert status["suspended_leases"] == 2
+        assert status["suspended_leases"] == 1
         assert (spec_one.namespace / "latest-good.json").read_bytes() == pointer_before
         assert _generation_dirs(spec_one) == generations_before
     finally:
@@ -2302,6 +2311,7 @@ def test_n1_root_ambiguity_suspends_source_and_readmission_proves_retained_bytes
 
         rebinding = _engine(tmp_path, enabled=True, payload_root=root_two)
         key = first._periodic_backup_registration.source_key
+        source = periodic._SCHEDULERS[key]
         assert rebinding._periodic_backup_registration.state == "suspended"
         assert rebinding._periodic_backup_registration.reason == "payload_root_ambiguous"
         _wait_for(
@@ -2311,7 +2321,8 @@ def test_n1_root_ambiguity_suspends_source_and_readmission_proves_retained_bytes
         assert status is not None and status["state"] == "SUSPENDED"
         assert status["active_leases"] == 0
         assert status["pending_leases"] == 0
-        assert status["suspended_leases"] == 3
+        assert status["suspended_leases"] == 2
+        assert rebinding._periodic_backup_registration.owner not in source.owner_records
         assert first._periodic_backup_registration.state == "suspended"
         assert clone._periodic_backup_registration.state == "suspended"
         assert rebinding._periodic_backup_registration.state == "suspended"
@@ -2343,7 +2354,8 @@ def test_n1_root_ambiguity_suspends_source_and_readmission_proves_retained_bytes
         assert resumed["readmission"]["snapshot_reference_count"] == 1
         assert resumed["approved_root_identity"] != (0, 0)
         assert resumed["active_leases"] == 2
-        assert resumed["suspended_leases"] == 1
+        assert resumed["suspended_leases"] == 0
+        assert rebinding._periodic_backup_registration.state == "suspended"
         assert clone._periodic_backup_registration.state == "active"
         assert rebinding._periodic_backup_registration.state == "suspended"
     finally:
@@ -3372,9 +3384,9 @@ def test_n1_unowned_suspended_source_blocks_ordinary_registration_until_old_exit
         release.set()
         old_worker.thread.join(5)
         assert not old_worker.thread.is_alive()
-        assert periodic.periodic_backup_source_status(key) is not None
-        second.shutdown()
         _wait_for(lambda: periodic.periodic_backup_source_status(key) is None)
+        second._periodic_backup_registration = periodic.acquire_backup_lease(second)
+        assert second._periodic_backup_registration.state == "active"
     finally:
         release.set()
         old_worker.thread.join(5)
@@ -3470,7 +3482,7 @@ def test_n4_missing_payload_root_retry_controller_start_failure_isolated(
         engine.shutdown()
 
 
-def test_missing_root_compatible_reacquisition_resumes_both_registrations(
+def test_missing_root_compatible_new_request_probes_without_owner_then_reacquires(
     tmp_path,
 ):
     shared = tmp_path / "shared"
@@ -3496,12 +3508,16 @@ def test_missing_root_compatible_reacquisition_resumes_both_registrations(
         )
         second_registration = second._periodic_backup_registration
         assert first_registration.state == "active"
-        assert second_registration.state == "active"
+        assert second_registration.state == "suspended"
         key = first_registration.source_key
         status = periodic.periodic_backup_source_status(key)
         assert status is not None
-        assert status["active_leases"] == 2
+        assert status["active_leases"] == 1
+        assert second_registration.owner not in periodic._SCHEDULERS[key].owner_records
         assert status["worker_count"] == 1
+        second._periodic_backup_registration = periodic.acquire_backup_lease(second)
+        assert second._periodic_backup_registration.state == "active"
+        assert periodic.periodic_backup_source_status(key)["active_leases"] == 2
         spec = periodic.build_periodic_backup_spec(first)
         _wait_for(lambda: len(_generation_dirs(spec)) == 1)
         assert periodic._read_verified_pointer(spec) is not None
@@ -3565,10 +3581,14 @@ def test_active_root_disappearance_reacquisition_requires_safe_readmission(
         assert missing["state"] == "SUSPENDED"
         assert missing["reason"] == "payload_root_missing"
         assert missing["active_leases"] == 0
-        assert missing["suspended_leases"] == 2
+        assert missing["suspended_leases"] == 1
+        assert second_registration.owner not in source.owner_records
         assert missing["retry_controller_count"] == 1
         assert missing["approved_root_identity"] == approved_identity
         assert missing["readmission_required"] is True
+        known_reacquisition = periodic.acquire_backup_lease(first)
+        assert known_reacquisition is first_registration
+        assert periodic.periodic_backup_source_status(key)["suspended_leases"] == 1
         assert (spec.namespace / "latest-good.json").read_bytes() == pointer_before
         assert [path.name for path in _generation_dirs(spec)] == generations_before
 
@@ -3590,7 +3610,7 @@ def test_active_root_disappearance_reacquisition_requires_safe_readmission(
         assert recovered is not None
         assert recovered["state"] == "ACTIVE"
         assert recovered["approved_root_identity"] == recreated_identity
-        assert recovered["active_leases"] == 2
+        assert recovered["active_leases"] == 1
         assert recovered["suspended_leases"] == 0
         assert recovered["worker_count"] == 1
         _wait_for(
@@ -3600,12 +3620,128 @@ def test_active_root_disappearance_reacquisition_requires_safe_readmission(
             == 0
         )
         assert first_registration.state == "active"
-        assert second_registration.state == "active"
+        assert second_registration.state == "suspended"
+        second._periodic_backup_registration = periodic.acquire_backup_lease(second)
+        assert second._periodic_backup_registration.state == "active"
+        assert periodic.periodic_backup_source_status(key)["active_leases"] == 2
         assert (spec.namespace / "latest-good.json").read_bytes() == pointer_before
         assert [path.name for path in _generation_dirs(spec)] == generations_before
     finally:
         if second is not None:
             second.shutdown()
+        first.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("field", "conflicting_kwargs"),
+    [
+        ("destination", {"destination": "different-periodic"}),
+        ("interval", {"interval_hours": 3.0}),
+        ("retention", {"keep_last": 3}),
+    ],
+)
+def test_policy_conflict_never_enters_suspended_history_or_reactivates(
+    tmp_path,
+    field,
+    conflicting_kwargs,
+):
+    shared = tmp_path / "shared"
+    payload_root = tmp_path / "payloads"
+    destination = tmp_path / "periodic"
+    _payload(payload_root / "payload.json", "retained payload")
+    first = _engine(
+        shared,
+        enabled=False,
+        payload_root=payload_root,
+        destination=destination,
+        interval_hours=6.0,
+        keep_last=2,
+    )
+    conflicting = None
+    compatible_probe = None
+    try:
+        _append(first, content=_placeholder("payload.json"))
+        spec = periodic.build_periodic_backup_spec(first)
+        assert periodic.run_periodic_backup(spec, due_only=False)["status"] == "ok"
+        pointer_before = (spec.namespace / "latest-good.json").read_bytes()
+        generations_before = [path.name for path in _generation_dirs(spec)]
+
+        first._config.periodic_backup_enabled = True
+        first._periodic_backup_registration = periodic.acquire_backup_lease(first)
+        admitted = first._periodic_backup_registration
+        key = admitted.source_key
+        source = periodic._SCHEDULERS[key]
+        approved_before = source.approved_root
+        policy_before = source.canonical_policy
+
+        (payload_root / "payload.json").unlink()
+        payload_root.rmdir()
+        compatible_probe = _engine(
+            shared,
+            enabled=True,
+            payload_root=payload_root,
+            destination=destination,
+            interval_hours=6.0,
+            keep_last=2,
+        )
+        assert compatible_probe._periodic_backup_registration.state == "suspended"
+        assert compatible_probe._periodic_backup_registration.owner not in source.owner_records
+        kwargs = {
+            "enabled": True,
+            "payload_root": payload_root,
+            "destination": destination,
+            "interval_hours": 6.0,
+            "keep_last": 2,
+        }
+        kwargs.update(conflicting_kwargs)
+        if field == "destination":
+            kwargs["destination"] = tmp_path / conflicting_kwargs["destination"]
+        conflicting = _engine(shared, **kwargs)
+        rejected = conflicting._periodic_backup_registration
+        assert rejected.state == "conflict"
+        assert rejected.reason == f"periodic_scheduler_spec_conflict:{field}"
+        _wait_for(
+            lambda: (periodic.periodic_backup_source_status(key) or {}).get("worker_count")
+            == 0
+        )
+        suspended = periodic.periodic_backup_source_status(key)
+        assert suspended is not None
+        assert suspended["state"] == "SUSPENDED"
+        assert suspended["reason"] == "payload_root_missing"
+        assert suspended["active_leases"] == 0
+        assert suspended["suspended_leases"] == 1
+        assert rejected.owner not in source.owner_records
+        assert set(source.owner_records) == {admitted.owner}
+        assert source.canonical_policy == policy_before
+        assert source.approved_root == approved_before
+        epoch_after_suspension = source.publication_epoch
+
+        _payload(payload_root / "payload.json", "retained payload")
+        rejected_again = periodic.acquire_backup_lease(conflicting)
+        assert rejected_again.state == "conflict"
+        assert rejected_again.owner not in source.owner_records
+        assert source.publication_epoch == epoch_after_suspension
+        assert set(source.owner_records) == {admitted.owner}
+        assert source.canonical_policy == policy_before
+        assert source.approved_root == approved_before
+        assert (spec.namespace / "latest-good.json").read_bytes() == pointer_before
+        assert [path.name for path in _generation_dirs(spec)] == generations_before
+
+        assert periodic.resume_backup_source(key, payload_root).state == "active"
+        resumed = periodic.periodic_backup_source_status(key)
+        assert resumed is not None
+        assert resumed["active_leases"] == 1
+        assert resumed["suspended_leases"] == 0
+        assert resumed["worker_count"] == 1
+        assert rejected.state == "conflict"
+        assert rejected.owner not in source.owner_records
+        assert (spec.namespace / "latest-good.json").read_bytes() == pointer_before
+        assert [path.name for path in _generation_dirs(spec)] == generations_before
+    finally:
+        if conflicting is not None:
+            conflicting.shutdown()
+        if compatible_probe is not None:
+            compatible_probe.shutdown()
         first.shutdown()
 
 
@@ -3837,10 +3973,12 @@ def test_equivalent_alias_shares_one_scheduler_and_full_release_allows_reconfigu
 
         changed._config.periodic_backup_enabled = True
         changed._periodic_backup_registration = periodic.acquire_backup_lease(changed)
-        pending = changed._periodic_backup_registration
-        assert pending.state == "pending"
-        assert pending.active is False
-        assert pending.reason == "waiting_for_stopping_worker_reconfiguration"
+        rejected = changed._periodic_backup_registration
+        assert rejected.state == "conflict"
+        assert rejected.active is False
+        assert rejected.reason == (
+            "periodic_scheduler_spec_conflict:destination+interval+retention"
+        )
         assert source.spec.destination_root == destination.resolve()
         assert source.scheduler is old_worker
 
@@ -3848,7 +3986,10 @@ def test_equivalent_alias_shares_one_scheduler_and_full_release_allows_reconfigu
         assert old_worker is not None
         old_worker.thread.join(5)
         assert not old_worker.thread.is_alive()
-        _wait_for(lambda: pending.state == "active")
+        _wait_for(lambda: periodic.periodic_backup_source_status(key) is None)
+        changed._periodic_backup_registration = periodic.acquire_backup_lease(changed)
+        assert changed._periodic_backup_registration.state == "active"
+        source = periodic._SCHEDULERS[key]
         assert source.spec.destination_root == (tmp_path / "changed-periodic").resolve()
         assert source.spec.interval_seconds == 3.0 * 3600.0
         assert source.spec.keep_last == 3

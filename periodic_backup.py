@@ -125,6 +125,16 @@ class PeriodicBackupSpec:
     payload_root_binding: PayloadRootBinding | None = None
 
 
+@dataclass(frozen=True)
+class PolicyFingerprint:
+    """Immutable admission policy for one canonical backup source."""
+
+    destination_root: Path
+    interval_seconds: float
+    keep_last: int
+    expected_root: Path
+
+
 @dataclass
 class PeriodicBackupRegistration:
     source_key: str
@@ -145,6 +155,18 @@ class PayloadRootBinding:
     path: Path
     device: int
     inode: int
+
+
+@dataclass(frozen=True)
+class OwnerRecord:
+    """Immutable admission authority plus the owner's current eligibility."""
+
+    owner_id: object
+    admitted_policy_fingerprint: PolicyFingerprint
+    admitted_root_binding: PayloadRootBinding | None
+    admission_generation: int
+    state: str
+    release_handle: PeriodicBackupRegistration
 
 
 def _payload_root_binding(path: Path) -> PayloadRootBinding:
@@ -2178,6 +2200,9 @@ class BackupSource:
     suspended_owners: set[object] = None  # type: ignore[assignment]
     owner_bindings: dict[object, PayloadRootBinding | None] = None  # type: ignore[assignment]
     registrations: dict[object, PeriodicBackupRegistration] = None  # type: ignore[assignment]
+    owner_records: dict[object, OwnerRecord] = None  # type: ignore[assignment]
+    canonical_policy: PolicyFingerprint | None = None
+    approved_root_history: tuple[PayloadRootBinding, ...] = ()
     readmission: dict[str, Any] | None = None
     # Once a distinct root has made history ambiguous, an optional scheduling
     # failure must not erase the last approved root and let ordinary admission
@@ -2191,7 +2216,6 @@ class BackupSource:
     # A previously admitted pathname disappeared. A new inode at that path
     # must pass retained-history readmission before any owner can publish.
     missing_root_replacement: bool = False
-    pending_spec: PeriodicBackupSpec | None = None
     conflict_count: int = 0
     last_conflict_reason: str = ""
 
@@ -2201,6 +2225,11 @@ class BackupSource:
         self.suspended_owners = set()
         self.owner_bindings = {}
         self.registrations = {}
+        self.owner_records = {}
+        if self.canonical_policy is None:
+            self.canonical_policy = _policy_fingerprint(self.spec)
+        if self.approved_root is not None and not self.approved_root_history:
+            self.approved_root_history = (self.approved_root,)
 
     @property
     def thread(self) -> threading.Thread | None:
@@ -2244,6 +2273,8 @@ class BackupSource:
         worker = self.scheduler.thread if self.scheduler is not None else None
         retry = self.retry_controller.thread if self.retry_controller is not None else None
         handoff = self.handoff_thread
+        policy = self.canonical_policy
+        assert policy is not None
         return {
             "source_key": self.key,
             "state": self.state,
@@ -2259,6 +2290,20 @@ class BackupSource:
             "destination": str(self.spec.destination_root),
             "interval_seconds": self.spec.interval_seconds,
             "keep_last": self.spec.keep_last,
+            "canonical_policy": {
+                "destination": str(policy.destination_root),
+                "interval_seconds": policy.interval_seconds,
+                "keep_last": policy.keep_last,
+                "expected_root": str(policy.expected_root),
+            },
+            "approved_root_history": [
+                {
+                    "path": str(binding.path),
+                    "device": binding.device,
+                    "inode": binding.inode,
+                }
+                for binding in self.approved_root_history
+            ],
             "active_leases": len(self.active_owners),
             "pending_leases": len(self.pending_owners),
             "suspended_leases": len(self.suspended_owners),
@@ -2314,6 +2359,8 @@ def _place_owner_locked(
     binding: PayloadRootBinding | None,
     state: str,
     reason: str = "",
+    *,
+    policy: PolicyFingerprint | None = None,
 ) -> PeriodicBackupRegistration:
     source.active_owners.discard(owner)
     source.pending_owners.discard(owner)
@@ -2325,7 +2372,23 @@ def _place_owner_locked(
         source.pending_owners.add(owner)
     elif state == "suspended":
         source.suspended_owners.add(owner)
-    return _set_registration_state(source, owner, state, reason)
+    registration = _set_registration_state(source, owner, state, reason)
+    record = source.owner_records.get(owner)
+    if record is None:
+        if policy is None or policy != source.canonical_policy:
+            raise AssertionError("owner placement requires the canonical admitted policy")
+        record = OwnerRecord(
+            owner,
+            policy,
+            binding,
+            source.publication_epoch,
+            state,
+            registration,
+        )
+    else:
+        record = replace(record, state=state)
+    source.owner_records[owner] = record
+    return registration
 
 
 def _forget_owner_locked(source: BackupSource, owner: object) -> None:
@@ -2334,6 +2397,7 @@ def _forget_owner_locked(source: BackupSource, owner: object) -> None:
     source.suspended_owners.discard(owner)
     source.owner_bindings.pop(owner, None)
     source.registrations.pop(owner, None)
+    source.owner_records.pop(owner, None)
 
 
 def _fail_source_locked(source: BackupSource, reason: str) -> None:
@@ -2349,6 +2413,7 @@ def _fail_source_locked(source: BackupSource, reason: str) -> None:
     source.suspended_owners.clear()
     source.owner_bindings.clear()
     source.registrations.clear()
+    source.owner_records.clear()
 
 
 def _start_worker_locked(source: BackupSource) -> str:
@@ -2380,9 +2445,18 @@ def _start_retry_controller_locked(source: BackupSource) -> str:
     return ""
 
 
-def _spec_conflict_fields(
-    current: PeriodicBackupSpec,
-    candidate: PeriodicBackupSpec,
+def _policy_fingerprint(spec: PeriodicBackupSpec) -> PolicyFingerprint:
+    return PolicyFingerprint(
+        destination_root=spec.destination_root,
+        interval_seconds=spec.interval_seconds,
+        keep_last=spec.keep_last,
+        expected_root=spec.payload_root,
+    )
+
+
+def _policy_conflict_fields(
+    current: PolicyFingerprint,
+    candidate: PolicyFingerprint,
 ) -> list[str]:
     fields: list[str] = []
     if current.destination_root != candidate.destination_root:
@@ -2392,6 +2466,49 @@ def _spec_conflict_fields(
     if current.keep_last != candidate.keep_last:
         fields.append("retention")
     return fields
+
+
+def _admitted_registration_locked(
+    engine,
+    source: BackupSource,
+) -> PeriodicBackupRegistration | None:
+    registration = getattr(engine, "_periodic_backup_registration", None)
+    visited: set[int] = set()
+    while isinstance(registration, PeriodicBackupRegistration) and id(registration) not in visited:
+        visited.add(id(registration))
+        if (
+            registration.source_key == source.key
+            and registration.owner in source.owner_records
+        ):
+            return source.registrations.get(registration.owner, registration)
+        registration = registration.retained_registration
+    return None
+
+
+def _retain_admitted_handle_locked(
+    registration: PeriodicBackupRegistration,
+    engine,
+    source: BackupSource,
+) -> PeriodicBackupRegistration:
+    registration.retained_registration = _admitted_registration_locked(engine, source)
+    return registration
+
+
+def _suspended_observation_locked(
+    source: BackupSource,
+    owner: object,
+    engine,
+) -> PeriodicBackupRegistration:
+    return _retain_admitted_handle_locked(
+        _registration(
+            source.key,
+            owner,
+            "suspended",
+            source.reason or "payload_root_ambiguous",
+        ),
+        engine,
+        source,
+    )
 
 
 def _conflict_registration_locked(
@@ -2404,22 +2521,7 @@ def _conflict_registration_locked(
     source.conflict_count += 1
     source.last_conflict_reason = reason
     registration = _registration(source.key, owner, "conflict", reason)
-    previous = getattr(engine, "_periodic_backup_registration", None)
-    visited: set[int] = set()
-    while (
-        isinstance(previous, PeriodicBackupRegistration)
-        and previous.retained_registration is not None
-        and id(previous) not in visited
-    ):
-        visited.add(id(previous))
-        previous = previous.retained_registration
-    if (
-        isinstance(previous, PeriodicBackupRegistration)
-        and previous.source_key == source.key
-        and previous.owner in source.registrations
-    ):
-        registration.retained_registration = previous
-    return registration
+    return _retain_admitted_handle_locked(registration, engine, source)
 
 
 def _retry_missing_root(key: str, source: BackupSource) -> bool:
@@ -2447,9 +2549,13 @@ def _retry_missing_root(key: str, source: BackupSource) -> bool:
             # references are checked through resume_backup_source().
             return False
         source.approved_root = binding
+        if binding not in source.approved_root_history:
+            source.approved_root_history = (*source.approved_root_history, binding)
         source.spec = replace(source.spec, payload_root_binding=binding)
         for owner in set(source.suspended_owners):
-            _place_owner_locked(source, owner, binding, "active")
+            record = source.owner_records.get(owner)
+            if record is not None and record.admitted_policy_fingerprint == source.canonical_policy:
+                _place_owner_locked(source, owner, binding, "active")
         source.state = "ACTIVE"
         source.reason = ""
         source.publication_epoch += 1
@@ -2525,10 +2631,6 @@ def _complete_handoff(key: str, source: BackupSource, worker: _Scheduler) -> Non
             source.reason = ""
             _drop_if_unowned_locked(source)
             return
-        if source.pending_spec is not None:
-            source.spec = source.pending_spec
-            source.pending_spec = None
-            source.approved_root = source.spec.payload_root_binding
         for owner in retained:
             binding = source.owner_bindings.get(owner)
             if binding is not None:
@@ -2614,6 +2716,7 @@ def acquire_backup_lease(engine) -> PeriodicBackupRegistration:
     try:
         spec = build_periodic_backup_spec(engine, allow_missing_payload_root=True)
         binding = spec.payload_root_binding
+        requested_policy = _policy_fingerprint(spec)
     except Exception as exc:
         logger.warning("LCM periodic backup registration failed closed: %s", exc)
         return _registration("", owner, "error", str(exc))
@@ -2640,6 +2743,7 @@ def acquire_backup_lease(engine) -> PeriodicBackupRegistration:
                     None,
                     "suspended",
                     "payload_root_missing",
+                    policy=requested_policy,
                 )
                 _SCHEDULERS[key] = source
                 error = _start_retry_controller_locked(source)
@@ -2647,12 +2751,28 @@ def acquire_backup_lease(engine) -> PeriodicBackupRegistration:
                     _drop_if_unowned_locked(source)
                 return registration
             source = BackupSource(key, spec, binding)
-            registration = _place_owner_locked(source, owner, binding, "active")
+            registration = _place_owner_locked(
+                source,
+                owner,
+                binding,
+                "active",
+                policy=requested_policy,
+            )
             _SCHEDULERS[key] = source
             error = _start_worker_locked(source)
             if error:
                 _drop_if_unowned_locked(source)
             return registration
+
+        canonical_policy = source.canonical_policy
+        assert canonical_policy is not None
+        conflicts = _policy_conflict_fields(canonical_policy, requested_policy)
+        if conflicts:
+            # A mismatch has presentation authority only. Root observation,
+            # suspension, retry, and admission state are intentionally untouched.
+            return _conflict_registration_locked(source, owner, conflicts, engine)
+
+        existing_registration = _admitted_registration_locked(engine, source)
         if (
             binding is None
             and spec.payload_root == source.spec.payload_root
@@ -2666,24 +2786,19 @@ def acquire_backup_lease(engine) -> PeriodicBackupRegistration:
             if error:
                 _drop_if_unowned_locked(source)
                 return _registration(key, owner, "error", error)
-            registration = _place_owner_locked(
-                source, owner, None, "suspended", "payload_root_missing"
-            )
             error = _start_retry_controller_locked(source)
             if error:
                 _drop_if_unowned_locked(source)
                 return _registration(key, owner, "error", error)
-            return registration
+            return existing_registration or _suspended_observation_locked(
+                source, owner, engine
+            )
         # Root authority is the older, stronger N1 invariant. A configured-DB
         # home rebind that changes both root and destination is ambiguity, not a
         # policy-only conflict, and must suspend every existing owner.
         if source.state == "SUSPENDED" and source.reason != "payload_root_missing":
-            return _place_owner_locked(
-                source,
-                owner,
-                binding,
-                "suspended",
-                source.reason or "payload_root_ambiguous",
+            return existing_registration or _suspended_observation_locked(
+                source, owner, engine
             )
         if (
             binding is not None
@@ -2694,76 +2809,52 @@ def acquire_backup_lease(engine) -> PeriodicBackupRegistration:
             if error:
                 _drop_if_unowned_locked(source)
                 return _registration(key, owner, "error", error)
-            return _place_owner_locked(source, owner, binding, "suspended", source.reason)
+            return existing_registration or _suspended_observation_locked(
+                source, owner, engine
+            )
         if spec.payload_root != source.spec.payload_root:
             error = _suspend_source_locked(source, "payload_root_ambiguous")
             if error:
                 _drop_if_unowned_locked(source)
                 return _registration(key, owner, "error", error)
-            return _place_owner_locked(source, owner, binding, "suspended", source.reason)
-
-        comparison_spec = source.pending_spec or source.spec
-        conflicts = _spec_conflict_fields(comparison_spec, spec)
-        worker = source.scheduler
-        fully_released_stopping = (
-            not source.active_owners
-            and not source.pending_owners
-            and not source.suspended_owners
-            and worker is not None
-            and worker.cancel.is_set()
-            and worker.thread.is_alive()
-        )
-        if conflicts and not fully_released_stopping:
-            return _conflict_registration_locked(source, owner, conflicts, engine)
-        if conflicts and fully_released_stopping:
-            source.pending_spec = spec
-            registration = _place_owner_locked(
-                source,
-                owner,
-                binding,
-                "pending",
-                "waiting_for_stopping_worker_reconfiguration",
+            return existing_registration or _suspended_observation_locked(
+                source, owner, engine
             )
-            source.state = "PENDING"
-            source.reason = "waiting_for_stopping_worker_reconfiguration"
-            error = _queue_handoff_locked(source)
-            if error:
-                _drop_if_unowned_locked(source)
-            return registration
+
+        worker = source.scheduler
         if source.state == "SUSPENDED" and source.reason == "payload_root_missing":
             if binding is None:
-                registration = _place_owner_locked(
-                    source, owner, None, "suspended", "payload_root_missing"
-                )
                 error = _start_retry_controller_locked(source)
                 if error:
                     _drop_if_unowned_locked(source)
-                return registration
+                return existing_registration or _suspended_observation_locked(
+                    source, owner, engine
+                )
             _retry_missing_root(key, source)
             if source.state == "ERROR":
                 return _registration(key, owner, "error", source.reason)
-            return _place_owner_locked(source, owner, binding, "active")
+            if existing_registration is not None:
+                return source.registrations.get(
+                    existing_registration.owner,
+                    existing_registration,
+                )
+            return _suspended_observation_locked(source, owner, engine)
         if source.state == "SUSPENDED":
-            return _place_owner_locked(
-                source,
-                owner,
-                binding,
-                "suspended",
-                source.reason or "payload_root_ambiguous",
+            return existing_registration or _suspended_observation_locked(
+                source, owner, engine
             )
         if binding is None:
             error = _suspend_source_locked(source, "payload_root_missing")
             if error:
                 _drop_if_unowned_locked(source)
                 return _registration(key, owner, "error", error)
-            registration = _place_owner_locked(
-                source, owner, None, "suspended", "payload_root_missing"
-            )
             error = _start_retry_controller_locked(source)
             if error:
                 _drop_if_unowned_locked(source)
                 return _registration(key, owner, "error", error)
-            return registration
+            return existing_registration or _suspended_observation_locked(
+                source, owner, engine
+            )
         if binding != source.approved_root:
             error = _suspend_source_locked(source, "payload_root_ambiguous")
             if error:
@@ -2774,9 +2865,20 @@ def acquire_backup_lease(engine) -> PeriodicBackupRegistration:
                 # optional handoff allocation as a valid suspension.
                 _drop_if_unowned_locked(source)
                 return _registration(key, owner, "error", error)
-            return _place_owner_locked(source, owner, binding, "suspended", source.reason)
+            return existing_registration or _suspended_observation_locked(
+                source, owner, engine
+            )
+        if existing_registration is not None:
+            return existing_registration
         if worker is not None and worker.cancel.is_set() and worker.thread.is_alive():
-            registration = _place_owner_locked(source, owner, binding, "pending", "waiting_for_stopping_worker")
+            registration = _place_owner_locked(
+                source,
+                owner,
+                binding,
+                "pending",
+                "waiting_for_stopping_worker",
+                policy=requested_policy,
+            )
             source.state = "PENDING"
             source.reason = "waiting_for_stopping_worker"
             error = _queue_handoff_locked(source)
@@ -2784,7 +2886,13 @@ def acquire_backup_lease(engine) -> PeriodicBackupRegistration:
                 _drop_if_unowned_locked(source)
             return registration
         if worker is None or not worker.thread.is_alive():
-            registration = _place_owner_locked(source, owner, binding, "active")
+            registration = _place_owner_locked(
+                source,
+                owner,
+                binding,
+                "active",
+                policy=requested_policy,
+            )
             source.state = "ACTIVE"
             source.reason = ""
             consumes_readmission = source.readmission_armed
@@ -2797,7 +2905,13 @@ def acquire_backup_lease(engine) -> PeriodicBackupRegistration:
                 # later incompatible lease create a fresh source.
                 source.readmission_armed = False
             return registration
-        return _place_owner_locked(source, owner, binding, "active")
+        return _place_owner_locked(
+            source,
+            owner,
+            binding,
+            "active",
+            policy=requested_policy,
+        )
 
 
 def register_periodic_backup(engine) -> PeriodicBackupRegistration:
@@ -2957,6 +3071,8 @@ def resume_backup_source(
             }
             return _registration(source_key, object(), "suspended", source.reason)
         source.approved_root = binding
+        if binding not in source.approved_root_history:
+            source.approved_root_history = (*source.approved_root_history, binding)
         source.spec = candidate
         source.state = "ACTIVE"
         source.reason = ""
@@ -2970,7 +3086,23 @@ def resume_backup_source(
         compatible_owners = {
             owner
             for owner in source.suspended_owners
-            if missing_root_replacement or source.owner_bindings.get(owner) == binding
+            if (
+                (record := source.owner_records.get(owner)) is not None
+                and record.admitted_policy_fingerprint == source.canonical_policy
+                and (
+                    record.admitted_root_binding is None
+                    or record.admitted_root_binding in source.approved_root_history
+                )
+                and (
+                    source.readmission_required
+                    or missing_root_replacement
+                    or source.owner_bindings.get(owner) == binding
+                )
+            )
+        }
+        retained_records = {
+            owner: source.owner_records[owner]
+            for owner in compatible_owners
         }
         for owner in compatible_owners:
             source.owner_bindings[owner] = binding
@@ -2985,6 +3117,30 @@ def resume_backup_source(
         if source.active_owners:
             error = _start_worker_locked(source)
             if error:
+                # Thread.start failure is non-fatal to LCM but must not erase
+                # the historical owners that explicit readmission just proved.
+                source.active_owners.clear()
+                source.pending_owners.clear()
+                source.suspended_owners = set(compatible_owners)
+                source.owner_records = retained_records
+                source.owner_bindings = {
+                    owner: binding for owner in compatible_owners
+                }
+                source.registrations = {
+                    owner: record.release_handle
+                    for owner, record in retained_records.items()
+                }
+                for owner, record in retained_records.items():
+                    _set_registration_state(
+                        source,
+                        owner,
+                        "suspended",
+                        f"historical_readmission_required:{error}",
+                    )
+                    source.owner_records[owner] = replace(
+                        record,
+                        state="suspended",
+                    )
                 _drop_if_unowned_locked(source)
                 return _registration(source_key, object(), "error", error)
         source.readmission_required = False

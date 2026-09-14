@@ -276,17 +276,21 @@ filesystems remain outside the guarantee.
 If the configured canonical payload-root pathname does not exist at initial
 admission, the source reports `SUSPENDED` with `payload_root_missing`, has no
 backup worker, and uses at most one bounded retry controller. The next retry tick
-or a compatible engine acquisition revalidates the pathname; once it is again a
-private plain directory, the source captures a fresh identity and starts exactly
-one worker. The controller never creates the root or publishes a generation.
+or a compatible engine acquisition can revalidate the pathname. Suspension is
+closed to new ownership: the probing engine owns no lease and cannot later become
+active from that observation. Only pre-existing historical owners whose immutable
+policy and approved-root history match can resume. A replacement inode additionally
+requires explicit historical-reference readmission before exactly one worker can
+start. The controller never creates the root or publishes a generation.
 
 The effective destination, validated interval, and retention are immutable while
 any lease remains admitted. A same-database/root request that changes one of
 those fields reports a typed `periodic_scheduler_spec_conflict:*` result and owns
 no lease; the existing worker and effective policy remain unchanged. Reconfigure
-only by fully releasing the old policy and acquiring the new one. If the old
-worker is still exiting, the new request remains non-active until that actual
-exit, and no old/new workers overlap.
+only by fully releasing the old policy and acquiring the new one after the old
+worker, retry controller, and handoff have actually retired. A changed-policy
+request during retirement remains a conflict and owns no pending lease; no old/new
+workers overlap.
 
 Before publication, staged database and payload bytes are revalidated under the
 source publication gate. A same-size in-place staged mutation rejects the new

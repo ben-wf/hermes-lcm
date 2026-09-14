@@ -866,6 +866,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 # the old handle so shutdown can release it without presenting
                 # the rejected request as active or implicitly superseding it.
                 self._periodic_backup_registration = replacement_registration
+            elif replacement_registration is previous_registration:
+                # A known owner was reclassified in place while the source
+                # suspended. It is the same release authority, not a new lease
+                # that permits unregistering the historical owner.
+                self._periodic_backup_registration = replacement_registration
             else:
                 self._periodic_backup_registration = replacement_registration
                 unregister_periodic_backup(previous_registration)

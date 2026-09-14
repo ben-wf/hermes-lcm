@@ -405,10 +405,14 @@ records whether each effective value came from the environment, YAML, or a defau
 
 An enabled scheduler whose externalized-payload root is missing is suspended,
 not reported active. It rechecks on a bounded scheduler cadence and on compatible
-engine acquisition, then resumes one worker after the same private root becomes
-valid. A canonical database has one immutable active destination, interval, and
-retention policy: conflicting requests are rejected rather than silently sharing
-the old worker. Change that policy only after every existing lease is released.
+engine acquisition. Suspension retains only already-admitted historical owners;
+a new compatible requester can probe recovery but gains no lease until a later
+active-state acquisition. Replacing the root inode requires explicit historical
+readmission before one worker resumes. A canonical database has one immutable
+destination, interval, retention, and expected-root policy: conflicting requests
+are rejected rather than silently sharing the old worker. Change that policy only
+after every owner is released and the worker, retry controller, and handoff have
+actually retired.
 
 When `LCM_FRESH_TAIL_MAX_TOKENS` is enabled, the protected suffix must satisfy
 both the message-count and token bounds. The newest message is never dropped,
