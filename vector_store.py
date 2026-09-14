@@ -26,6 +26,7 @@ from typing import Any, Iterator, Optional, Sequence
 
 from .config import LCMConfig
 from .db_bootstrap import (
+    SQLITE_BUSY_TIMEOUT_SECONDS,
     configure_connection,
     ensure_chunk_tables,
     ensure_embedding_tables,
@@ -375,7 +376,7 @@ class VectorStore:
         # _write_transaction.
         self._conn = sqlite3.connect(
             str(self.db_path),
-            timeout=5.0,
+            timeout=SQLITE_BUSY_TIMEOUT_SECONDS,
             check_same_thread=False,
             isolation_level=None,
         )
