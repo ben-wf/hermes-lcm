@@ -167,6 +167,14 @@ def _execute_wal_conversion_with_lock_retry(
     takes this path, so the retry only matters on first boot after an
     install/upgrade or on a rollback-journal restore.
     """
+    try:
+        cur = conn.execute("PRAGMA journal_mode")
+        row = cur.fetchone()
+        if row and str(row[0]).lower() == "wal":
+            return
+    except sqlite3.OperationalError:
+        pass
+
     deadline = time.monotonic() + budget_ms / 1000.0
     delay_seconds = 0.005
     while True:
@@ -174,7 +182,8 @@ def _execute_wal_conversion_with_lock_retry(
             conn.execute("PRAGMA journal_mode=WAL")
             return
         except sqlite3.OperationalError as exc:
-            if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+            msg = str(exc).lower()
+            if not any(k in msg for k in ("locked", "busy", "disk i/o", "ioerr")) or time.monotonic() >= deadline:
                 raise
         time.sleep(delay_seconds)
         delay_seconds = min(delay_seconds * 2, 0.25)

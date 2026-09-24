@@ -145,6 +145,7 @@ from . import tools as lcm_tools
 logger = logging.getLogger(__name__)
 
 _ASSERTION_EXTRACTION_PROCESS_SLOT = threading.BoundedSemaphore(1)
+_STORAGE_BIND_PROCESS_LOCK = threading.RLock()
 
 class _RollupMaintenanceScheduler:
     """Run deduplicated rollup jobs on one process-wide worker.
@@ -692,52 +693,53 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
         """Bind store/DAG/lifecycle helpers to one SQLite database."""
-        self._assertions = None
-        self._query_views = None
-        self._adaptive_retrieval = None
-        self._assertion_extractor = None
-        try:
-            self._store = MessageStore(
-                db_path,
-                ingest_protection_config=self._config,
-                hermes_home=hermes_home,
-            )
-            self._dag = SummaryDAG(db_path)
-            if self._config.temporal_rollups_enabled:
-                # Install the transaction-coupled summary mutation triggers before
-                # this engine can publish or delete a DAG node.
-                initialize_rollup_invalidation_outbox(self._dag)
-            self._lifecycle = LifecycleStateStore(db_path)
-            self._assertions = (
-                AssertionStore(db_path)
-                if bool(getattr(self._config, "assertions_enabled", False))
-                else None
-            )
-            self._query_views = (
-                QueryViewStore(db_path)
-                if bool(getattr(self._config, "query_views_enabled", False))
-                or bool(getattr(self._config, "adaptive_retrieval_enabled", False))
-                else None
-            )
-            self._adaptive_retrieval = (
-                AdaptiveRetrievalRegistry(self._query_views)
-                if bool(
-                    getattr(self._config, "adaptive_retrieval_enabled", False)
+        with _STORAGE_BIND_PROCESS_LOCK:
+            self._assertions = None
+            self._query_views = None
+            self._adaptive_retrieval = None
+            self._assertion_extractor = None
+            try:
+                self._store = MessageStore(
+                    db_path,
+                    ingest_protection_config=self._config,
+                    hermes_home=hermes_home,
                 )
-                else None
-            )
-            if (
-                self._assertions is not None
-                and bool(getattr(self._config, "assertion_extraction_enabled", False))
-            ):
-                self._assertion_extractor = ModelAssertionExtractor(
-                    self._assertions,
-                    model=self._assertion_extraction_model(),
-                    timeout_seconds=self._assertion_extraction_timeout(),
+                self._dag = SummaryDAG(db_path)
+                if self._config.temporal_rollups_enabled:
+                    # Install the transaction-coupled summary mutation triggers before
+                    # this engine can publish or delete a DAG node.
+                    initialize_rollup_invalidation_outbox(self._dag)
+                self._lifecycle = LifecycleStateStore(db_path)
+                self._assertions = (
+                    AssertionStore(db_path)
+                    if bool(getattr(self._config, "assertions_enabled", False))
+                    else None
                 )
-        except Exception:
-            self._close_storage()
-            raise
+                self._query_views = (
+                    QueryViewStore(db_path)
+                    if bool(getattr(self._config, "query_views_enabled", False))
+                    or bool(getattr(self._config, "adaptive_retrieval_enabled", False))
+                    else None
+                )
+                self._adaptive_retrieval = (
+                    AdaptiveRetrievalRegistry(self._query_views)
+                    if bool(
+                        getattr(self._config, "adaptive_retrieval_enabled", False)
+                    )
+                    else None
+                )
+                if (
+                    self._assertions is not None
+                    and bool(getattr(self._config, "assertion_extraction_enabled", False))
+                ):
+                    self._assertion_extractor = ModelAssertionExtractor(
+                        self._assertions,
+                        model=self._assertion_extraction_model(),
+                        timeout_seconds=self._assertion_extraction_timeout(),
+                    )
+            except Exception:
+                self._close_storage()
+                raise
 
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
