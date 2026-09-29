@@ -475,31 +475,42 @@ class MessageStore:
         ingested_at = time.time()
 
         def _insert_single() -> int:
-            cur = self._conn.execute(
-                """INSERT INTO messages
-                   (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
-                    tool_name, timestamp, token_estimate, pinned, ingested_at,
-                    observed_at, observed_at_source)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    session_id,
-                    _normalize_source_value(source),
-                    _normalize_conversation_id_value(conversation_id),
-                    msg.get("role", "unknown"),
-                    _normalize_content_value(msg.get("content")),
-                    msg.get("tool_call_id"),
-                    tc_json,
-                    msg.get("tool_name"),
-                    ingested_at,
-                    token_estimate,
-                    0,
-                    ingested_at,
-                    observed_at,
-                    "host_message_timestamp" if observed_at is not None else None,
-                ),
-            )
-            self._conn.commit()
-            return cur.lastrowid
+            deadline = time.monotonic() + 5.0
+            delay = 0.01
+            while True:
+                try:
+                    cur = self._conn.execute(
+                        """INSERT INTO messages
+                           (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
+                            tool_name, timestamp, token_estimate, pinned, ingested_at,
+                            observed_at, observed_at_source)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            session_id,
+                            _normalize_source_value(source),
+                            _normalize_conversation_id_value(conversation_id),
+                            msg.get("role", "unknown"),
+                            _normalize_content_value(msg.get("content")),
+                            msg.get("tool_call_id"),
+                            tc_json,
+                            msg.get("tool_name"),
+                            ingested_at,
+                            token_estimate,
+                            0,
+                            ingested_at,
+                            observed_at,
+                            "host_message_timestamp" if observed_at is not None else None,
+                        ),
+                    )
+                    self._conn.commit()
+                    return cur.lastrowid
+                except sqlite3.OperationalError as exc:
+                    msg_text = str(exc).lower()
+                    if any(k in msg_text for k in ("locked", "busy")) and time.monotonic() < deadline:
+                        time.sleep(delay)
+                        delay = min(delay * 2, 0.2)
+                        continue
+                    raise
 
         with self._write_lock:
             try:
@@ -581,38 +592,49 @@ class MessageStore:
             token_estimates = [0] * len(messages)
 
         def _execute_batch():
-            batch_ids = []
-            with self._conn:
-                for msg, est in zip(messages, token_estimates):
-                    tc = msg.get("tool_calls")
-                    tc_json = json.dumps(tc) if tc else None
-                    ts = time.time()
-                    observed_at = _normalize_observed_at(msg.get("timestamp"))
-                    cur = self._conn.execute(
-                        """INSERT INTO messages
-                           (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
-                            tool_name, timestamp, token_estimate, pinned, ingested_at,
-                            observed_at, observed_at_source)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (
-                            session_id,
-                            _normalize_source_value(source),
-                            _normalize_conversation_id_value(conversation_id),
-                            msg.get("role", "unknown"),
-                            _normalize_content_value(msg.get("content")),
-                            msg.get("tool_call_id"),
-                            tc_json,
-                            msg.get("tool_name"),
-                            ts,
-                            est,
-                            0,
-                            ts,
-                            observed_at,
-                            "host_message_timestamp" if observed_at is not None else None,
-                        ),
-                    )
-                    batch_ids.append(cur.lastrowid)
-            return batch_ids
+            deadline = time.monotonic() + 5.0
+            delay = 0.01
+            while True:
+                try:
+                    batch_ids = []
+                    with self._conn:
+                        for msg, est in zip(messages, token_estimates):
+                            tc = msg.get("tool_calls")
+                            tc_json = json.dumps(tc) if tc else None
+                            ts = time.time()
+                            observed_at = _normalize_observed_at(msg.get("timestamp"))
+                            cur = self._conn.execute(
+                                """INSERT INTO messages
+                                   (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
+                                    tool_name, timestamp, token_estimate, pinned, ingested_at,
+                                    observed_at, observed_at_source)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (
+                                    session_id,
+                                    _normalize_source_value(source),
+                                    _normalize_conversation_id_value(conversation_id),
+                                    msg.get("role", "unknown"),
+                                    _normalize_content_value(msg.get("content")),
+                                    msg.get("tool_call_id"),
+                                    tc_json,
+                                    msg.get("tool_name"),
+                                    ts,
+                                    est,
+                                    0,
+                                    ts,
+                                    observed_at,
+                                    "host_message_timestamp" if observed_at is not None else None,
+                                ),
+                            )
+                            batch_ids.append(cur.lastrowid)
+                    return batch_ids
+                except sqlite3.OperationalError as exc:
+                    msg_text = str(exc).lower()
+                    if any(k in msg_text for k in ("locked", "busy")) and time.monotonic() < deadline:
+                        time.sleep(delay)
+                        delay = min(delay * 2, 0.2)
+                        continue
+                    raise
 
         with self._write_lock:
             try:
