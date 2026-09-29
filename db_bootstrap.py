@@ -133,7 +133,8 @@ def configure_connection(conn: sqlite3.Connection) -> None:
     conn.execute(f"PRAGMA busy_timeout={busy_timeout}")
     _execute_wal_conversion_with_lock_retry(conn)
     conn.execute("PRAGMA synchronous=FULL")
-    conn.execute("PRAGMA wal_autocheckpoint=500")
+    wal_checkpoint_pages = int(os.environ.get("LCM_WAL_AUTOCHECKPOINT", "4000"))
+    conn.execute(f"PRAGMA wal_autocheckpoint={wal_checkpoint_pages}")
     conn.execute("PRAGMA journal_size_limit=67108864")
     mmap_env = os.environ.get("LCM_MMAP_SIZE")
     if mmap_env is not None:
@@ -167,18 +168,14 @@ def _execute_wal_conversion_with_lock_retry(
     takes this path, so the retry only matters on first boot after an
     install/upgrade or on a rollback-journal restore.
     """
-    try:
-        cur = conn.execute("PRAGMA journal_mode")
-        row = cur.fetchone()
-        if row and str(row[0]).lower() == "wal":
-            return
-    except sqlite3.OperationalError:
-        pass
-
     deadline = time.monotonic() + budget_ms / 1000.0
     delay_seconds = 0.005
     while True:
         try:
+            cur = conn.execute("PRAGMA journal_mode")
+            row = cur.fetchone()
+            if row and str(row[0]).lower() == "wal":
+                return
             conn.execute("PRAGMA journal_mode=WAL")
             return
         except sqlite3.OperationalError as exc:

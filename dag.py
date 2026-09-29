@@ -897,10 +897,6 @@ class SummaryDAG:
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
             conn.close()
             self._conn = None
 
