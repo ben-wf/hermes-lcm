@@ -388,8 +388,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
       5. Active context = system prompt + DAG summaries + fresh tail
     """
 
-    def __init__(self, config: LCMConfig | None = None,
-                 hermes_home: str = ""):
+    def __init__(
+        self,
+        config: LCMConfig | None = None,
+        hermes_home: str = "",
+        *,
+        _storage_source: Optional["LCMEngine"] = None,
+    ):
         self._config = config or LCMConfig.from_env()
         self._hermes_home = hermes_home
         self._assertion_extraction_metrics_lock = threading.RLock()
@@ -407,8 +412,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._assertion_extraction_last_error = ""
         self._assertion_extraction_last_model = ""
 
-        db_path = self._resolve_db_path(hermes_home)
-        self._bind_storage(db_path, hermes_home)
+        if _storage_source is not None and getattr(_storage_source, "_store", None) is not None:
+            self._owns_storage = False
+            self._store = _storage_source._store
+            self._dag = _storage_source._dag
+            self._lifecycle = _storage_source._lifecycle
+            self._assertions = _storage_source._assertions
+            self._query_views = _storage_source._query_views
+            self._adaptive_retrieval = _storage_source._adaptive_retrieval
+            self._assertion_extractor = _storage_source._assertion_extractor
+        else:
+            self._owns_storage = True
+            db_path = self._resolve_db_path(hermes_home)
+            self._bind_storage(db_path, hermes_home)
 
         self._session_id: str = ""
         self._session_platform: str = ""
@@ -633,14 +649,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         sharing one registered instance across agents can let one conversation
         rebind another conversation's raw-message ingest and lifecycle state.
 
-        The clone shares the same durable SQLite database path/configuration,
-        but gets independent session/cursor/lifecycle runtime state. Runtime
-        model and context-window metadata is copied so the clone is immediately
-        budget-aware even before a compatible Hermes host calls update_model().
+        The clone shares the same durable SQLite database and thread-safe storage
+        helpers, but gets independent session/cursor/lifecycle runtime state.
+        Sharing the storage helpers avoids connection churn, schema migration
+        redundancy, and Darwin APFS filesystem lock contention (disk I/O error)
+        when agents are spawned concurrently. Runtime model and context-window
+        metadata is copied so the clone is immediately budget-aware even before
+        a compatible Hermes host calls update_model().
         """
         clone = type(self)(
             config=copy.deepcopy(self._config),
             hermes_home=self._hermes_home,
+            _storage_source=self,
         )
         clone.model = self.model
         clone.base_url = self.base_url
@@ -676,8 +696,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         AIAgent instances. A default object deepcopy walks into MessageStore,
         SummaryDAG, and LifecycleStateStore sqlite3.Connection handles, which
         cannot be pickled. LCM already exposes clone_for_agent() as the safe
-        boundary: share durable configuration/database path, but allocate fresh
-        per-agent runtime/storage helper objects.
+        boundary: share durable configuration/database path and thread-safe
+        storage helpers, but allocate fresh per-agent runtime state.
         """
         clone = self.clone_for_agent()
         memo[id(self)] = clone
@@ -754,6 +774,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
+        if not getattr(self, "_owns_storage", True):
+            for attr in (
+                "_adaptive_retrieval",
+                "_store",
+                "_dag",
+                "_lifecycle",
+                "_assertions",
+                "_query_views",
+                "_assertion_extractor",
+            ):
+                setattr(self, attr, None)
+            return
+
         for attr in (
             "_adaptive_retrieval",
             "_store",
@@ -769,6 +802,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     close()
                 except Exception:
                     logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
+            setattr(self, attr, None)
 
     def _assertion_extraction_model(self) -> str:
         return str(
@@ -863,6 +897,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._close_storage()
         self._hermes_home = hermes_home
         self._bind_storage(db_path, hermes_home)
+        self._owns_storage = True
         self._reset_profile_runtime_state()
         logger.info("LCM rebound storage for Hermes home %s", hermes_home)
         return True
@@ -3502,11 +3537,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
             return
         try:
-            with _temporary_sqlite_busy_timeout(
+            timeout_targets = (
                 [
                     getattr(self._store, "_conn", None),
                     getattr(self._lifecycle, "_conn", None),
-                ],
+                ]
+                if getattr(self, "_owns_storage", True)
+                else []
+            )
+            with _temporary_sqlite_busy_timeout(
+                timeout_targets,
                 _SESSION_END_BUSY_TIMEOUT_MS,
             ):
                 try:
@@ -6668,6 +6708,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def shutdown(self):
         self._unregister_active_engine_binding()
+        if not getattr(self, "_owns_storage", True):
+            return
         if self._adaptive_retrieval is not None:
             self._adaptive_retrieval.close()
         self._store.close()
