@@ -2945,10 +2945,6 @@ class VectorStore:
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn is not None:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
             conn.close()
             self._conn = None
         with self._cache_lock:

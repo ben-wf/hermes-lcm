@@ -78,6 +78,14 @@ class TestConfigureConnectionPragmas:
         # After setting, PRAGMA wal_autocheckpoint returns the NEW value.
         val = conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0]
         conn.close()
+        assert val == 4000, f"expected wal_autocheckpoint=4000, got {val}"
+
+    def test_wal_autocheckpoint_override(self, db_path: Path, monkeypatch):
+        monkeypatch.setenv("LCM_WAL_AUTOCHECKPOINT", "500")
+        conn = sqlite3.connect(str(db_path))
+        configure_connection(conn)
+        val = conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0]
+        conn.close()
         assert val == 500, f"expected wal_autocheckpoint=500, got {val}"
 
     def test_journal_size_limit(self, db_path: Path):

@@ -507,6 +507,33 @@ class MessageStore:
             except sqlite3.DatabaseError as exc:
                 if not is_fts_corruption_error(exc):
                     raise
+                try:
+                    self._conn.execute("SELECT count(*) FROM metadata")
+                except sqlite3.DatabaseError:
+                    raise exc
+
+                msg_count = 0
+                try:
+                    row = self._conn.execute("SELECT count(*) FROM messages").fetchone()
+                    msg_count = row[0] if row else 0
+                except sqlite3.DatabaseError:
+                    pass
+
+                if msg_count > 1000:
+                    logger.warning(
+                        "FTS trigger corruption during append on large store (%d rows): %s. "
+                        "Temporarily disabling triggers to protect active turn.",
+                        msg_count, exc,
+                    )
+                    try:
+                        self._conn.execute("DROP TRIGGER IF EXISTS msg_fts_insert")
+                        self._conn.execute("DROP TRIGGER IF EXISTS msg_fts_update")
+                        self._conn.execute("DROP TRIGGER IF EXISTS msg_fts_delete")
+                        self._conn.commit()
+                        return _insert_single()
+                    except Exception:
+                        pass
+
                 logger.warning(
                     "Detected database/FTS corruption during message append (%s). Triggering self-healing repair and retrying...",
                     exc,
@@ -593,6 +620,33 @@ class MessageStore:
             except sqlite3.DatabaseError as exc:
                 if not is_fts_corruption_error(exc):
                     raise
+                try:
+                    self._conn.execute("SELECT count(*) FROM metadata")
+                except sqlite3.DatabaseError:
+                    raise exc
+
+                msg_count = 0
+                try:
+                    row = self._conn.execute("SELECT count(*) FROM messages").fetchone()
+                    msg_count = row[0] if row else 0
+                except sqlite3.DatabaseError:
+                    pass
+
+                if msg_count > 1000:
+                    logger.warning(
+                        "FTS trigger corruption during batch append on large store (%d rows): %s. "
+                        "Temporarily disabling triggers to protect active turn.",
+                        msg_count, exc,
+                    )
+                    try:
+                        self._conn.execute("DROP TRIGGER IF EXISTS msg_fts_insert")
+                        self._conn.execute("DROP TRIGGER IF EXISTS msg_fts_update")
+                        self._conn.execute("DROP TRIGGER IF EXISTS msg_fts_delete")
+                        self._conn.commit()
+                        return _execute_batch()
+                    except Exception:
+                        pass
+
                 logger.warning(
                     "Detected database/FTS corruption during message batch append (%s). Triggering self-healing repair and retrying...",
                     exc,
@@ -1780,13 +1834,6 @@ class MessageStore:
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn:
-            # Graceful shutdown hygiene: checkpoint committed WAL frames before
-            # releasing the connection.  This does not run on crash/kill, and
-            # PASSIVE can leave frames behind when another reader is active.
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass  # best-effort only; don't let this mask the real close()
             conn.close()
             self._conn = None
 
