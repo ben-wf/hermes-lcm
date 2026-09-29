@@ -178,9 +178,9 @@ def _execute_wal_conversion_with_lock_retry(
                 return
             conn.execute("PRAGMA journal_mode=WAL")
             return
-        except sqlite3.OperationalError as exc:
+        except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
             msg = str(exc).lower()
-            if not any(k in msg for k in ("locked", "busy", "disk i/o", "ioerr")) or time.monotonic() >= deadline:
+            if not any(k in msg for k in ("locked", "busy", "disk i/o", "ioerr", "file is not a database")) or time.monotonic() >= deadline:
                 raise
         time.sleep(delay_seconds)
         delay_seconds = min(delay_seconds * 2, 0.25)
