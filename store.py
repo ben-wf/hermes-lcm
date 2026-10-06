@@ -28,6 +28,8 @@ from .db_bootstrap import (
     configure_connection,
     ensure_external_content_fts,
     is_fts_corruption_error,
+    is_migration_step_complete,
+    mark_migration_step_complete,
     refuse_schema_version_too_new,
     repair_external_content_fts,
     run_versioned_migrations,
@@ -72,6 +74,7 @@ _MESSAGE_SELECT_COLUMNS = (
 )
 _MESSAGE_SELECT_COLUMN_COUNT = len(_MESSAGE_SELECT_COLUMNS.split(","))
 _UNKNOWN_SOURCE = "unknown"
+_INGESTED_AT_BACKFILL_STEP = "messages_ingested_at_backfill_v1"
 
 
 def _same_directory_identity(left: os.stat_result, right: os.stat_result) -> bool:
@@ -453,9 +456,17 @@ class MessageStore:
             "observed_at_source",
             "ALTER TABLE messages ADD COLUMN observed_at_source TEXT",
         )
-        self._conn.execute(
-            "UPDATE messages SET ingested_at = timestamp WHERE ingested_at IS NULL"
-        )
+        # One-time legacy backfill, gated by a done-marker. Unmarked, this UPDATE
+        # is a full-table scan on every store open: no index can serve
+        # ``ingested_at IS NULL`` on a column that is NULL for zero rows, so a
+        # large DB re-reads the whole ``messages`` table at each start only to
+        # find nothing to do. New rows get ``ingested_at`` on the write path, so
+        # once the legacy rows are filled the statement never has work again.
+        if not is_migration_step_complete(self._conn, _INGESTED_AT_BACKFILL_STEP):
+            self._conn.execute(
+                "UPDATE messages SET ingested_at = timestamp WHERE ingested_at IS NULL"
+            )
+            mark_migration_step_complete(self._conn, _INGESTED_AT_BACKFILL_STEP)
 
     # -- Write operations ---------------------------------------------------
 
